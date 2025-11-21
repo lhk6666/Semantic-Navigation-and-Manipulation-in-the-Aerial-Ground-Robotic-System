@@ -1,0 +1,7 @@
+{
+    "batch_size": 12,
+    "learning_rate": 2e-5,
+    "num_epochs": 100,
+    "warmup_steps": 500,
+    "weight_decay": 0.01
+}

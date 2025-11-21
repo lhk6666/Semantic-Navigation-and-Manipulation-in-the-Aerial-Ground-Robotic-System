@@ -1,0 +1,58 @@
+# === os ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === editor/IDE ===
+.vscode/
+.idea/
+*.iml
+*~
+*.swp
+
+# === general ===
+build/
+dist/
+logs/
+tmp/
+*.log
+*.out
+*.o
+
+# === CMake/Make ===
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# === Python ===
+__pycache__/
+*.py[cod]
+env/
+venv/
+.env/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# === ROS / Catkin ===
+devel/
+install/
+log/
+.catkin_workspace
+.rosinstall
+
+# === Node.js ===
+node_modules/
+
+# === subpackage ===
+/scripts/**/build/
+/scripts/**/dist/
+/scripts/**/env/
+/scripts/**/node_modules/
+/scripts/**/__pycache__/
+/scripts/llm_multiagent/**/__pycache__/
+/scripts/**/*.py[cod]
+.azure
+
+VPR_Slam
