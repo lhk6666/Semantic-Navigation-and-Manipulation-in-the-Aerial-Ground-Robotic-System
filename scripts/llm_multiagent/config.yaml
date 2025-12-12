@@ -1,9 +1,9 @@
 # Gemini configuration file
-project_id: xxx
-finetuned_location: xxx # Can be updated to other locations according to the localization of the customization
+project_id: 584672874437
+finetuned_location: us-west1 # Can be updated to other locations according to the localization of the customization
 flash_model: gemini-2.5-flash # Can be updated to other flash models according to the latest release
-pro_model: gemini-2.5-pro # Can be updated to other pro models according to the latest release
-finetuned_model: xxx # The model ID of the fine-tuned model (The number after the 'endpoint/' in the URL of the fine-tuned model)
+pro_model: gemini-3-pro-preview # Can be updated to other pro models according to the latest release
+finetuned_model: 416209131578327040 # The model ID of the fine-tuned model (The number after the 'endpoint/' in the URL of the fine-tuned model)
 
 # Semantic Map Configuration
 semantic_map: [-1.0, 1.0, -1.0, 1.0] # The range of the semantic map in the x and y axes (meter unit)

@@ -56,3 +56,6 @@ node_modules/
 .azure
 
 VPR_Slam
+
+vlm_planner_full/
+vlm_trajectory_results/
