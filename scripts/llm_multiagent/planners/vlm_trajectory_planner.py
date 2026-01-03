@@ -62,8 +62,8 @@ class VLMTrajectoryPlanner:
         
         self.generation_config = {
             "max_output_tokens": 8192,  # Increased for full trajectory JSON
-            "temperature": 0.3,  # Lower temperature for more consistent paths
-            "top_p": 0.8,
+            "temperature": 0.0,  # Lower temperature for more consistent paths
+            "top_p": 0.0,
             "response_mime_type": "application/json",  # Force JSON output
         }
         
