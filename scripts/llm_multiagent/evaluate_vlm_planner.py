@@ -1,197 +1,173 @@
 #!/usr/bin/env python3
-"""
-VLM + Planner Evaluation Script for Semantic Map Dataset (Multi-threaded)
+"""Minimal VLM+Planner evaluation (multi-threaded).
 
-This script evaluates the VLM+Planner baseline on the VLA dataset.
-Features:
-- Multi-threaded VLM calls for faster evaluation
-- Automatic retry on errors
-- Checkpoint saving for resuming interrupted runs
+Pipeline per episode:
+  1) Load semantic-map image + GT start/goal/trajectory from Zarr
+  2) Call SemanticMapPlanner.analyze_scene(image, instruction)
+  3) Plan with PathPlanner.generate_safe_path_astar using obstacle bboxes
+  4) Compute metrics and save JSON/CSV
+
+Intentionally minimal: no checkpointing, no visualization, no heavy retry/backoff.
 """
 
-import os
-import sys
-import json
-import zarr
-import numpy as np
-import cv2
-from pathlib import Path
-from tqdm import tqdm
 import argparse
-from dataclasses import dataclass, asdict
-from typing import List, Tuple, Optional, Dict, Any
-import time
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend for threading
-import matplotlib.pyplot as plt
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import importlib.util
+import json
+import re
+import sys
 import threading
-import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import zarr
+from tqdm import tqdm
+
 
 # Add paths for imports
 script_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(script_dir))
 sys.path.insert(0, str(script_dir / "planners"))
 
-# Import planners
 from path_planner import PathPlanner
 from semantic_map_planner import SemanticMapPlanner
 
-# Thread-local storage for planners (each thread gets its own instance)
+
 thread_local = threading.local()
 
 
-def get_vlm_planner():
-    """Get thread-local VLM planner instance"""
-    if not hasattr(thread_local, 'vlm_planner'):
+def get_vlm_planner() -> SemanticMapPlanner:
+    if not hasattr(thread_local, "vlm_planner"):
         thread_local.vlm_planner = SemanticMapPlanner()
     return thread_local.vlm_planner
 
 
-def get_path_planner():
-    """Get thread-local path planner instance"""
-    if not hasattr(thread_local, 'path_planner'):
-        thread_local.path_planner = PathPlanner(num_ctrl_points=8, obstacle_effect_area=0.5)
+def get_path_planner() -> PathPlanner:
+    if not hasattr(thread_local, "path_planner"):
+        thread_local.path_planner = PathPlanner()
     return thread_local.path_planner
 
 
-# Standard number of waypoints for fair curvature comparison
-STANDARD_NUM_WAYPOINTS = 20
+def _load_flowvla_trajectory_metrics_module():
+    """Load FlowVLA's shared trajectory_metrics.py to avoid metric drift."""
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / "scripts" / "test" / "trajectory_metrics.py"
+        if candidate.exists():
+            spec = importlib.util.spec_from_file_location("flowvla_trajectory_metrics", str(candidate))
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Failed to load spec for {candidate}")
+            module = importlib.util.module_from_spec(spec)
+            # Python 3.12 dataclasses expects the module to be registered.
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            return module
+    raise FileNotFoundError(
+        "Could not locate FlowVLA/scripts/test/trajectory_metrics.py from this script location."
+    )
 
 
-def resample_trajectory(traj: np.ndarray, num_points: int) -> np.ndarray:
-    """
-    Resample trajectory to fixed number of points using linear interpolation.
-    This ensures fair comparison of curvature across different methods.
-    
-    Args:
-        traj: Original trajectory [N, 2]
-        num_points: Target number of points
-    
-    Returns:
-        Resampled trajectory [num_points, 2]
-    """
-    if len(traj) < 2:
-        return traj
-    
-    if len(traj) == num_points:
-        return traj
-    
-    # Compute cumulative arc length
-    diffs = np.diff(traj, axis=0)
-    segment_lengths = np.linalg.norm(diffs, axis=1)
-    cumulative_length = np.concatenate([[0], np.cumsum(segment_lengths)])
-    total_length = cumulative_length[-1]
-    
-    if total_length < 1e-8:
-        # Degenerate trajectory (all points same)
-        return np.tile(traj[0], (num_points, 1))
-    
-    # Generate uniform samples along arc length
-    target_lengths = np.linspace(0, total_length, num_points)
-    
-    # Interpolate
-    resampled = np.zeros((num_points, 2))
-    for i, target_len in enumerate(target_lengths):
-        # Find segment containing this length
-        idx = np.searchsorted(cumulative_length, target_len, side='right') - 1
-        idx = np.clip(idx, 0, len(traj) - 2)
-        
-        # Interpolate within segment
-        seg_start_len = cumulative_length[idx]
-        seg_len = segment_lengths[idx] if idx < len(segment_lengths) else 1e-8
-        
-        if seg_len < 1e-8:
-            t = 0
-        else:
-            t = (target_len - seg_start_len) / seg_len
-        t = np.clip(t, 0, 1)
-        
-        resampled[i] = traj[idx] * (1 - t) + traj[idx + 1] * t
-    
-    return resampled
+_FLOWVLA_METRICS = _load_flowvla_trajectory_metrics_module()
+TrajectoryMetrics = _FLOWVLA_METRICS.TrajectoryMetrics
+STANDARD_NUM_WAYPOINTS = _FLOWVLA_METRICS.STANDARD_NUM_WAYPOINTS
 
 
-class TrajectoryMetrics:
+def scene_group_id(scene_id: str) -> str:
+    """Group scene variants like scene700_01/scene700_02 into scene700.
+
+    For non-matching scene IDs (e.g., random hashes), returns the original.
     """
-    Trajectory evaluation metrics (same as HMRS/scripts/test/metrics.py)
-    - FGE: Final Goal Error (Euclidean distance to goal)
-    - CR: Collision Rate (1 if any point hits obstacle, 0 otherwise)
-    - PLR: Path Length Ratio (pred_length / gt_length)
-    - Curv: Curvature (mean absolute angle change between segments)
-    
-    Note: Curvature is computed on resampled trajectory (STANDARD_NUM_WAYPOINTS points)
-    for fair comparison across methods with different waypoint counts.
-    """
-    def __init__(self, pred_traj: np.ndarray, gt_traj: np.ndarray, 
-                 goal_pos: np.ndarray, obstacle_mask: Optional[np.ndarray] = None):
-        self.pred_traj = np.array(pred_traj)
-        self.gt_traj = np.array(gt_traj)
-        self.goal_pos = np.array(goal_pos)
-        self.obstacle_mask = obstacle_mask  # (H, W) binary mask, 1=obstacle
-        
-    def final_goal_error(self) -> float:
-        """FGE: Euclidean distance from final position to goal"""
-        if len(self.pred_traj) == 0:
-            return float('inf')
-        return float(np.linalg.norm(self.pred_traj[-1] - self.goal_pos))
-    
-    def collision_rate(self) -> float:
-        """CR: 1.0 if trajectory collides with obstacle, 0.0 otherwise"""
-        if self.obstacle_mask is None:
-            return 0.0
-        H, W = self.obstacle_mask.shape
-        for pt in self.pred_traj:
-            # Convert normalized [0,1] to pixel coordinates
-            cx = int(pt[0] * W)
-            cy = int(pt[1] * H)
-            # Clamp to valid range
-            cx = np.clip(cx, 0, W - 1)
-            cy = np.clip(cy, 0, H - 1)
-            if self.obstacle_mask[cy, cx] == 1:
-                return 1.0
-        return 0.0
-    
-    def path_length_ratio(self) -> float:
-        """PLR: pred_path_length / gt_path_length"""
-        if len(self.pred_traj) < 2 or len(self.gt_traj) < 2:
-            return 1.0
-        pred_len = self._compute_path_length(self.pred_traj)
-        gt_len = self._compute_path_length(self.gt_traj)
-        return float(pred_len / gt_len) if gt_len > 1e-6 else 1.0
-    
-    def curvature(self, num_points: int = STANDARD_NUM_WAYPOINTS) -> float:
-        """Curv: Mean absolute angle change between consecutive segments (radians)
-        
-        Note: Trajectory is resampled to num_points for fair comparison.
-        """
-        # Resample to standard number of points for fair comparison
-        resampled_traj = resample_trajectory(self.pred_traj, num_points)
-        return self._compute_curvature(resampled_traj)
-    
-    def _compute_path_length(self, path: np.ndarray) -> float:
-        """Compute total path length"""
-        if len(path) < 2:
-            return 0.0
-        return float(np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1)))
-    
-    def _compute_curvature(self, path: np.ndarray) -> float:
-        """Compute mean curvature as angle change between segments"""
-        if len(path) < 3:
-            return 0.0
-        # Compute direction vectors
-        vectors = path[1:] - path[:-1]
-        norms = np.linalg.norm(vectors, axis=1)
-        valid = norms > 1e-6
-        vectors = vectors[valid]
-        if len(vectors) < 2:
-            return 0.0
-        # Compute angles
-        angles = np.arctan2(vectors[:, 1], vectors[:, 0])
-        # Compute angle differences, wrapped to [-pi, pi]
-        diffs = angles[1:] - angles[:-1]
-        diffs = (diffs + np.pi) % (2 * np.pi) - np.pi
-        return float(np.mean(np.abs(diffs)))
+    if not scene_id:
+        return "unknown"
+    s = str(scene_id).strip()
+    s = s.split("/")[-1].split("\\")[-1]
+    m = re.match(r"^(scene\d+)(?:[_-]\d+)?$", s)
+    if m:
+        return m.group(1)
+    parts = re.split(r"[_-]", s)
+    if parts and re.fullmatch(r"scene\d+", parts[0]):
+        return parts[0]
+    m = re.match(r"^(scene\d+)", s)
+    if m:
+        return m.group(1)
+    return s
+
+
+def compute_per_scene_summary(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Compute per-scene metric summary from episode-level results."""
+    valid = [r for r in results if not r.get("error") and r.get("fge") != float("inf")]
+    scene_results: Dict[str, List[Dict[str, Any]]] = {}
+    for r in valid:
+        sid = scene_group_id(r.get("scene_id", "unknown"))
+        scene_results.setdefault(sid, []).append(r)
+
+    def _mean(xs: List[float]) -> Optional[float]:
+        return float(np.mean(xs)) if xs else None
+
+    def _std(xs: List[float]) -> Optional[float]:
+        return float(np.std(xs)) if xs else None
+
+    summary: List[Dict[str, Any]] = []
+    for sid, scene_res in sorted(scene_results.items()):
+        fge_vals = [float(x["fge"]) for x in scene_res]
+        cr_vals = [float(x["cr"]) for x in scene_res]
+        plr_vals = [float(x["plr"]) for x in scene_res]
+        curv_vals = [float(x["curv"]) for x in scene_res]
+        tgt_errs = [
+            float(x["target_detection_error"])
+            for x in scene_res
+            if x.get("target_detection_error") is not None
+        ]
+
+        summary.append(
+            {
+                "scene_id": sid,
+                "num_episodes": int(len(scene_res)),
+                "fge": _mean(fge_vals),
+                "fge_std": _std(fge_vals),
+                "cr": _mean(cr_vals),
+                "cr_std": _std(cr_vals),
+                "plr": _mean(plr_vals),
+                "plr_std": _std(plr_vals),
+                "curv": _mean(curv_vals),
+                "curv_std": _std(curv_vals),
+                "target_error": _mean(tgt_errs),
+                "target_error_std": _std(tgt_errs),
+            }
+        )
+    return summary
+
+
+def postprocess_existing_results(*, results_path: Path, output_dir: Path, inplace: bool) -> None:
+    with open(results_path, "r", encoding="utf-8") as f:
+        blob = json.load(f)
+    episode_results = blob.get("episode_results") or []
+    if not isinstance(episode_results, list):
+        raise ValueError("results.json missing 'episode_results' list")
+
+    per_scene = compute_per_scene_summary(episode_results)
+    blob["per_scene"] = per_scene
+
+    scene_csv_file = output_dir / "scene_metrics.csv"
+    with open(scene_csv_file, "w", encoding="utf-8") as f:
+        f.write("scene_id,num_episodes,fge,fge_std,cr,cr_std,plr,plr_std,curv,curv_std,target_error,target_error_std\n")
+        for s in per_scene:
+            f.write(
+                f"{s.get('scene_id','')},{s.get('num_episodes','')},"
+                f"{s.get('fge','')},{s.get('fge_std','')},"
+                f"{s.get('cr','')},{s.get('cr_std','')},"
+                f"{s.get('plr','')},{s.get('plr_std','')},"
+                f"{s.get('curv','')},{s.get('curv_std','')},"
+                f"{s.get('target_error','')},{s.get('target_error_std','')}\n"
+            )
+    print(f"Per-scene CSV saved to {scene_csv_file}")
+
+    out_path = results_path if inplace else (output_dir / "results_postprocessed.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(blob, f, indent=2)
+    print(f"Postprocessed results saved to {out_path}")
 
 
 @dataclass
@@ -329,337 +305,311 @@ class DPZarrDataset:
             obstacle_mask=obstacle_mask
         )
 
-
-def evaluate_single_episode(episode: EpisodeData, max_retries: int = 3) -> Dict[str, Any]:
-    """
-    Evaluate a single episode with retry mechanism
-    """
-    result = {
-        'episode_idx': episode.episode_idx,
-        'scene_id': episode.scene_id,
-        'instruction': episode.instruction,
-        'target_category': episode.target_category,
-        'direction': episode.direction,
-        'fge': float('inf'),
-        'cr': 0.0,  # Collision Rate (1=collision, 0=no collision)
-        'plr': 1.0,
-        'curv': 0.0,
-        'target_detection_error': None,
-        'vlm_target': None,
-        'num_obstacles': 0,
-        'planner_success': False,
-        'error': None,
-        'retries': 0,
-        'has_mask': episode.obstacle_mask is not None
+def evaluate_single_episode(
+    episode: EpisodeData,
+    *,
+    grid_size: int,
+    num_points: int,
+    allow_diagonal: bool,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "episode_idx": episode.episode_idx,
+        "scene_id": episode.scene_id,
+        "instruction": episode.instruction,
+        "target_category": episode.target_category,
+        "direction": episode.direction,
+        "has_mask": episode.obstacle_mask is not None,
+        "planner_success": False,
+        "error": None,
+        "vlm_target_center": None,
+        "vlm_goal": None,
+        "target_detection_error": None,
+        "num_obstacles": 0,
+        "fge": float("inf"),
+        "cr": 0.0,
+        "plr": 1.0,
+        "curv": 0.0,
+        "pred_traj_len": 0,
+        "gt_traj_len": int(len(episode.gt_trajectory)),
     }
-    
-    for attempt in range(max_retries):
-        try:
-            # Get thread-local planners
-            vlm_planner = get_vlm_planner()
-            path_planner = get_path_planner()
-            
-            # Always use GT start
-            start = episode.start
-            
-            # Call VLM to detect target and obstacles
-            vlm_result = vlm_planner.analyze_scene(episode.image, episode.instruction)
-            
-            # Get target from VLM
-            if vlm_result.get('target') and vlm_result['target'].get('x') is not None:
-                goal = np.array([vlm_result['target']['x'], vlm_result['target']['y']])
-                result['vlm_target'] = [float(goal[0]), float(goal[1])]
-                result['target_detection_error'] = float(np.linalg.norm(goal - episode.goal))
-            else:
-                # VLM failed to detect target - this is a failure case
-                # Use GT goal for path planning but mark metrics as failed
-                goal = episode.goal
-                result['vlm_target'] = None
-                result['vlm_target_detection_failed'] = True
-            
-            # Get obstacles from VLM
-            obstacles = []
-            if vlm_result.get('obstacles'):
-                for obs in vlm_result['obstacles']:
-                    if obs.get('x') is not None:
-                        obstacles.append(np.array([obs['x'], obs['y']]))
-            result['num_obstacles'] = len(obstacles)
-            
-            # Generate path using PathPlanner
-            scale = 10.0
-            start_scaled = start * scale
-            goal_scaled = goal * scale
-            obstacles_scaled = [(obs * scale).tolist() for obs in obstacles]
-            
-            path = path_planner.generate_safe_path(
-                A=start_scaled.tolist(),
-                C=goal_scaled.tolist(),
-                obstacles=obstacles_scaled
-            )
-            result['planner_success'] = True
-            
-            # Convert back to normalized coordinates
-            trajectory = np.array([[p[0] / scale, p[1] / scale] for p in path])
-            
-            # Compute metrics with obstacle mask
-            metrics = TrajectoryMetrics(
-                pred_traj=trajectory,
-                gt_traj=episode.gt_trajectory,
-                goal_pos=episode.goal,
-                obstacle_mask=episode.obstacle_mask  # Pass obstacle mask for CR
-            )
-            
-            # If VLM failed to detect target, FGE should be computed against GT goal
-            # but marked as invalid (since we cheated by using GT goal for planning)
-            if result.get('vlm_target_detection_failed'):
-                # FGE is meaningless when VLM failed - we used GT goal, so FGE≈0
-                # Set to None to exclude from statistics, or compute actual error
-                # which would be the distance from the path endpoint to GT goal
-                result['fge'] = None  # Mark as invalid
-            else:
-                result['fge'] = metrics.final_goal_error()
-            
-            result['cr'] = metrics.collision_rate()  # Now computes real collision rate
-            result['plr'] = metrics.path_length_ratio()
-            result['curv'] = metrics.curvature()
-            result['pred_traj_len'] = len(trajectory)
-            result['gt_traj_len'] = len(episode.gt_trajectory)
-            result['retries'] = attempt
-            
-            return result
-            
-        except Exception as e:
-            result['retries'] = attempt + 1
-            result['error'] = str(e)
-            if attempt < max_retries - 1:
-                time.sleep(1 * (attempt + 1))  # Exponential backoff
-            else:
-                # Final attempt failed, return with error
-                traceback.print_exc()
-    
-    return result
 
+    try:
+        vlm_planner = get_vlm_planner()
+        path_planner = get_path_planner()
 
-def save_checkpoint(results: List[Dict], output_dir: Path, checkpoint_name: str = "checkpoint.json"):
-    """Save intermediate results"""
-    checkpoint_path = output_dir / checkpoint_name
-    with open(checkpoint_path, 'w') as f:
-        json.dump(results, f)
+        vlm = vlm_planner.analyze_scene(episode.image, episode.instruction, add_grid=False, require_target=True)
+        if not isinstance(vlm, dict) or vlm.get("error"):
+            raise ValueError(str(vlm.get("error") if isinstance(vlm, dict) else "VLM returned non-dict"))
 
+        target = vlm.get("target")
+        if not isinstance(target, dict):
+            raise ValueError("Missing target")
 
-def load_checkpoint(output_dir: Path, checkpoint_name: str = "checkpoint.json") -> List[Dict]:
-    """Load checkpoint if exists"""
-    checkpoint_path = output_dir / checkpoint_name
-    if checkpoint_path.exists():
-        with open(checkpoint_path, 'r') as f:
-            return json.load(f)
-    return []
+        if isinstance(target.get("center"), (list, tuple)) and len(target.get("center")) == 2:
+            result["vlm_target_center"] = [float(target["center"][0]), float(target["center"][1])]
+
+        goal_obj = vlm.get("goal")
+        if not (isinstance(goal_obj, dict) and goal_obj.get("x") is not None and goal_obj.get("y") is not None):
+            raise ValueError("Missing goal")
+
+        goal_xy = (float(goal_obj["x"]), float(goal_obj["y"]))
+        result["vlm_goal"] = [float(goal_xy[0]), float(goal_xy[1])]
+        result["target_detection_error"] = float(np.linalg.norm(np.array(goal_xy) - episode.goal))
+
+        obstacles = vlm.get("obstacles") or []
+        obstacle_bboxes = []
+        if isinstance(obstacles, list):
+            for obs in obstacles:
+                if isinstance(obs, dict) and isinstance(obs.get("bbox"), (list, tuple)) and len(obs.get("bbox")) == 4:
+                    obstacle_bboxes.append([float(x) for x in obs["bbox"]])
+        result["num_obstacles"] = int(len(obstacle_bboxes))
+
+        forbidden_bboxes = []
+        if vlm.get("approach_side") and vlm.get("approach_side") != "none":
+            if isinstance(target.get("bbox"), (list, tuple)) and len(target.get("bbox")) == 4:
+                forbidden_bboxes.append([float(x) for x in target["bbox"]])
+
+        path = path_planner.generate_safe_path_astar(
+            start_xy=episode.start,
+            goal_xy=goal_xy,
+            obstacle_bboxes=obstacle_bboxes,
+            forbidden_bboxes=forbidden_bboxes,
+            grid_size=grid_size,
+            allow_diagonal=allow_diagonal,
+            num_points=num_points,
+        )
+
+        trajectory = np.array(path, dtype=float)
+        result["pred_traj_len"] = int(len(trajectory))
+        result["planner_success"] = True
+
+        metrics = TrajectoryMetrics(
+            pred_traj=trajectory,
+            gt_traj=episode.gt_trajectory,
+            goal_pos=episode.goal,
+            obstacle_mask=episode.obstacle_mask,
+        )
+
+        result["fge"] = metrics.final_goal_error(num_points=STANDARD_NUM_WAYPOINTS)
+        result["cr"] = metrics.collision_rate(num_points=STANDARD_NUM_WAYPOINTS)
+        result["plr"] = metrics.path_length_ratio(num_points=STANDARD_NUM_WAYPOINTS)
+        result["curv"] = metrics.curvature(num_points=STANDARD_NUM_WAYPOINTS)
+
+        return result
+
+    except Exception as e:
+        result["error"] = str(e)
+        return result
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate VLM+Planner (Multi-threaded)')
-    parser.add_argument('--dataset', type=str, 
-                       default='/media/dragon_llm/linux_ssd/vla_dataset_unified/val',
-                       help='Path to Zarr dataset')
-    parser.add_argument('--output_dir', type=str,
-                       default='vlm_planner_results_v2',
-                       help='Output directory')
-    parser.add_argument('--num_episodes', type=int, default=None,
-                       help='Number of episodes (None = all)')
-    parser.add_argument('--num_workers', type=int, default=2,
-                       help='Number of parallel workers')
-    parser.add_argument('--max_retries', type=int, default=10,
-                       help='Max retries per episode')
-    parser.add_argument('--checkpoint_every', type=int, default=100,
-                       help='Save checkpoint every N episodes')
-    parser.add_argument('--resume', action='store_true',
-                       help='Resume from checkpoint')
-    parser.add_argument('--visualize_every', type=int, default=0,
-                       help='Visualize every N episodes (0 = disabled)')
+    parser = argparse.ArgumentParser(description="Evaluate VLM+Planner (minimal, multi-threaded)")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="/media/dragon_llm/linux_ssd/vla_dataset_unified_static_v13/val",
+        help="Path to dataset root (contains episode_meta.json and dataset.zarr or direct zarr)",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="vlm_planner_results",
+        help="Output directory",
+    )
+    parser.add_argument(
+        "--num_episodes",
+        type=int,
+        default=None,
+        help="Number of episodes (default: all)",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help="Evaluate every N-th episode (default: 1, i.e., evaluate all)",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=2,
+        help="Parallel workers",
+    )
+    parser.add_argument(
+        "--grid_size",
+        type=int,
+        default=128,
+        help="A* grid resolution",
+    )
+    parser.add_argument(
+        "--num_points",
+        type=int,
+        default=50,
+        help="Number of points in planned trajectory",
+    )
+    parser.add_argument(
+        "--no_diagonal",
+        action="store_true",
+        help="Disable diagonal moves in A*",
+    )
+    parser.add_argument(
+        "--postprocess",
+        action="store_true",
+        help="Postprocess an existing results.json under output_dir (no evaluation run)",
+    )
+    parser.add_argument(
+        "--results_json",
+        type=str,
+        default=None,
+        help="Path to results.json for postprocess (default: output_dir/results.json)",
+    )
+    parser.add_argument(
+        "--inplace",
+        action="store_true",
+        help="Overwrite the input results.json when postprocessing (default: write results_postprocessed.json)",
+    )
     args = parser.parse_args()
     
-    # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Load dataset
+
+    if args.postprocess:
+        results_path = Path(args.results_json) if args.results_json else (output_dir / "results.json")
+        postprocess_existing_results(results_path=results_path, output_dir=output_dir, inplace=bool(args.inplace))
+        return
+
     print(f"Loading dataset from {args.dataset}")
     dataset = DPZarrDataset(args.dataset)
-    
-    # Determine episodes to evaluate
-    num_episodes = args.num_episodes or dataset.num_episodes
-    num_episodes = min(num_episodes, dataset.num_episodes)
-    
-    # Load checkpoint if resuming
-    results = []
-    completed_indices = set()
-    if args.resume:
-        results = load_checkpoint(output_dir)
-        completed_indices = {r['episode_idx'] for r in results}
-        print(f"Resumed from checkpoint: {len(completed_indices)} episodes completed")
-    
-    # Get episodes to process
-    episodes_to_process = [i for i in range(num_episodes) if i not in completed_indices]
-    
-    print(f"\nEvaluating {len(episodes_to_process)} episodes with {args.num_workers} workers...")
-    print(f"Max retries: {args.max_retries}, Checkpoint every: {args.checkpoint_every}")
-    
-    # Process with thread pool
-    processed_count = len(completed_indices)
-    error_count = 0
-    
+
+    num_episodes_limit = args.num_episodes or dataset.num_episodes
+    num_episodes_limit = min(num_episodes_limit, dataset.num_episodes)
+
+    stride = max(1, int(args.stride))
+    episode_indices = list(range(0, num_episodes_limit, stride))
+    num_eval = len(episode_indices)
+
+    allow_diagonal = not args.no_diagonal
+    results: List[Dict[str, Any]] = []
+
+    print(
+        f"Evaluating {num_eval} episodes (stride={stride}, limit={num_episodes_limit}) "
+        f"with {args.num_workers} workers"
+    )
+
     with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
-        # Submit all tasks
         future_to_idx = {}
-        for idx in episodes_to_process:
+        for idx in episode_indices:
             episode = dataset.get_episode(idx)
-            future = executor.submit(evaluate_single_episode, episode, args.max_retries)
-            future_to_idx[future] = idx
-        
-        # Process completed tasks with progress bar
-        with tqdm(total=len(episodes_to_process), initial=0) as pbar:
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    result = future.result()
-                    results.append(result)
-                    
-                    if result.get('error'):
-                        error_count += 1
-                    
-                    processed_count += 1
-                    
-                    # Update progress bar
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        'errors': error_count,
-                        'fge': f"{result.get('fge', 0):.3f}" if result.get('fge') != float('inf') else 'inf'
-                    })
-                    
-                    # Save checkpoint
-                    if processed_count % args.checkpoint_every == 0:
-                        save_checkpoint(results, output_dir)
-                        
-                except Exception as e:
-                    print(f"\nFatal error on episode {idx}: {e}")
-                    error_count += 1
-                    results.append({
-                        'episode_idx': idx,
-                        'error': str(e),
-                        'fge': float('inf'),
-                        'cr': 0.0,
-                        'plr': 1.0,
-                        'curv': 0.0
-                    })
-    
-    # Final checkpoint
-    save_checkpoint(results, output_dir)
-    
-    # Compute aggregate metrics
-    # Exclude inf values and None values (VLM detection failures)
-    valid_results = [r for r in results if r.get('fge') is not None and r.get('fge') != float('inf')]
-    # Count VLM detection failures
-    vlm_detection_failures = sum(1 for r in results if r.get('vlm_target_detection_failed', False))
-    
-    fge_values = [r['fge'] for r in valid_results]
-    cr_values = [r['cr'] for r in valid_results]
-    plr_values = [r['plr'] for r in valid_results]
-    curv_values = [r['curv'] for r in valid_results]
-    target_errors = [r['target_detection_error'] for r in valid_results if r.get('target_detection_error') is not None]
-    mask_count = sum(1 for r in valid_results if r.get('has_mask', False))
-    
+            fut = executor.submit(
+                evaluate_single_episode,
+                episode,
+                grid_size=args.grid_size,
+                num_points=args.num_points,
+                allow_diagonal=allow_diagonal,
+            )
+            future_to_idx[fut] = idx
+
+        with tqdm(total=num_eval, desc="Episodes", dynamic_ncols=True) as pbar:
+            for fut in as_completed(future_to_idx):
+                r = fut.result()
+                results.append(r)
+                pbar.update(1)
+
+    # Sort results by episode_idx for stable outputs.
+    results.sort(key=lambda x: int(x.get("episode_idx", 0)))
+
+    valid = [r for r in results if not r.get("error") and r.get("fge") != float("inf")]
+    err_count = sum(1 for r in results if r.get("error"))
+    mask_count = sum(1 for r in valid if r.get("has_mask"))
+
+    def _mean(xs: List[float]) -> Optional[float]:
+        return float(np.mean(xs)) if xs else None
+
+    def _std(xs: List[float]) -> Optional[float]:
+        return float(np.std(xs)) if xs else None
+
+    fge_vals = [float(r["fge"]) for r in valid]
+    cr_vals = [float(r["cr"]) for r in valid]
+    plr_vals = [float(r["plr"]) for r in valid]
+    curv_vals = [float(r["curv"]) for r in valid]
+    tgt_errs = [float(r["target_detection_error"]) for r in valid if r.get("target_detection_error") is not None]
+
     print("\n" + "=" * 60)
     print("RESULTS SUMMARY")
     print("=" * 60)
     print(f"Total episodes: {len(results)}")
-    print(f"Valid episodes (with VLM detection): {len(valid_results)}")
-    print(f"VLM detection failures: {vlm_detection_failures}")
-    print(f"Failed episodes (other errors): {error_count}")
-    print(f"Episodes with mask: {mask_count}/{len(valid_results)}")
-    print(f"\nTrajectory Metrics (only for episodes with successful VLM detection):")
-    print(f"  FGE  (Final Goal Error):  {np.mean(fge_values):.4f} ± {np.std(fge_values):.4f}")
-    print(f"  CR   (Collision Rate):    {np.mean(cr_values)*100:.2f}%")
-    print(f"  PLR  (Path Length Ratio): {np.mean(plr_values):.4f} ± {np.std(plr_values):.4f}")
-    print(f"  Curv (Curvature):         {np.mean(curv_values):.4f} ± {np.std(curv_values):.4f}")
-    
-    if target_errors:
-        print(f"\nVLM Target Detection:")
-        print(f"  Mean Error: {np.mean(target_errors):.4f} ± {np.std(target_errors):.4f}")
-        print(f"  Detection Rate: {len(target_errors)/len(valid_results)*100:.1f}%")
-    
-    # Per-scene results
-    scene_results = {}
-    for r in valid_results:
-        scene_id = r.get('scene_id', 'unknown')
-        if scene_id not in scene_results:
-            scene_results[scene_id] = []
-        scene_results[scene_id].append(r)
-    
-    print("\n" + "=" * 60)
-    print("PER-SCENE RESULTS")
-    print("=" * 60)
-    
-    scene_summary = []
-    for scene_id, scene_res in sorted(scene_results.items()):
-        # Filter out VLM detection failures for FGE calculation
-        scene_valid_fge = [r['fge'] for r in scene_res if r.get('fge') is not None]
-        scene_fge = np.mean(scene_valid_fge) if scene_valid_fge else float('nan')
-        scene_cr = np.mean([r['cr'] for r in scene_res])
-        scene_plr = np.mean([r['plr'] for r in scene_res])
-        scene_curv = np.mean([r['curv'] for r in scene_res])
-        vlm_fail_count = sum(1 for r in scene_res if r.get('vlm_target_detection_failed', False))
-        print(f"{scene_id}: FGE={scene_fge:.4f}, CR={scene_cr*100:.1f}%, PLR={scene_plr:.3f}, Curv={scene_curv:.4f}, N={len(scene_res)}, VLM_fail={vlm_fail_count}")
-        scene_summary.append({
-            'scene_id': scene_id,
-            'fge': float(scene_fge) if not np.isnan(scene_fge) else None,
-            'cr': float(scene_cr),
-            'plr': float(scene_plr),
-            'curv': float(scene_curv),
-            'num_episodes': len(scene_res),
-            'vlm_detection_failures': vlm_fail_count
-        })
-    
-    # Save final results
+    print(f"Valid episodes: {len(valid)}")
+    print(f"Errors: {err_count}")
+    print(f"Valid episodes with mask: {mask_count}/{len(valid)}")
+    if valid:
+        print(f"FGE  : {_mean(fge_vals):.4f} ± {_std(fge_vals):.4f}")
+        print(f"CR   : {_mean(cr_vals)*100.0:.2f}%")
+        print(f"PLR  : {_mean(plr_vals):.4f} ± {_std(plr_vals):.4f}")
+        print(f"Curv : {_mean(curv_vals):.4f} ± {_std(curv_vals):.4f}")
+    if tgt_errs:
+        print(f"Target error: {_mean(tgt_errs):.4f} ± {_std(tgt_errs):.4f}")
+
     results_file = output_dir / "results.json"
-    with open(results_file, 'w') as f:
-        json.dump({
-            'config': {
-                'dataset': args.dataset,
-                'num_episodes': len(results),
-                'num_workers': args.num_workers,
-                'max_retries': args.max_retries
+    with open(results_file, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "config": {
+                    "dataset": args.dataset,
+                    "num_episodes": num_eval,
+                    "num_episodes_limit": int(num_episodes_limit),
+                    "stride": int(stride),
+                    "num_workers": args.num_workers,
+                    "grid_size": args.grid_size,
+                    "num_points": args.num_points,
+                    "allow_diagonal": allow_diagonal,
+                },
+                "overall": {
+                    "fge_mean": _mean(fge_vals),
+                    "fge_std": _std(fge_vals),
+                    "cr_mean": _mean(cr_vals),
+                    "plr_mean": _mean(plr_vals),
+                    "plr_std": _std(plr_vals),
+                    "curv_mean": _mean(curv_vals),
+                    "curv_std": _std(curv_vals),
+                    "target_error_mean": _mean(tgt_errs),
+                    "target_error_std": _std(tgt_errs),
+                    "num_valid": len(valid),
+                    "num_errors": err_count,
+                    "num_with_mask": mask_count,
+                },
+                "episode_results": results,
+                "per_scene": compute_per_scene_summary(results),
             },
-            'overall': {
-                'fge_mean': float(np.mean(fge_values)) if fge_values else None,
-                'fge_std': float(np.std(fge_values)) if fge_values else None,
-                'cr_mean': float(np.mean(cr_values)) if cr_values else None,  # Collision Rate
-                'plr_mean': float(np.mean(plr_values)) if plr_values else None,
-                'plr_std': float(np.std(plr_values)) if plr_values else None,
-                'curv_mean': float(np.mean(curv_values)) if curv_values else None,
-                'curv_std': float(np.std(curv_values)) if curv_values else None,
-                'target_detection_error': float(np.mean(target_errors)) if target_errors else None,
-                'num_valid': len(valid_results),
-                'num_vlm_detection_failures': vlm_detection_failures,
-                'num_errors': error_count,
-                'num_with_mask': mask_count
-            },
-            'per_scene': scene_summary,
-            'episode_results': results
-        }, f, indent=2)
-    
-    print(f"\nResults saved to {results_file}")
-    
-    # Save CSV
+            f,
+            indent=2,
+        )
+    print(f"Results saved to {results_file}")
+
+    scene_csv_file = output_dir / "scene_metrics.csv"
+    per_scene = compute_per_scene_summary(results)
+    with open(scene_csv_file, "w", encoding="utf-8") as f:
+        f.write("scene_id,num_episodes,fge,fge_std,cr,cr_std,plr,plr_std,curv,curv_std,target_error,target_error_std\n")
+        for s in per_scene:
+            f.write(
+                f"{s.get('scene_id','')},{s.get('num_episodes','')},"
+                f"{s.get('fge','')},{s.get('fge_std','')},"
+                f"{s.get('cr','')},{s.get('cr_std','')},"
+                f"{s.get('plr','')},{s.get('plr_std','')},"
+                f"{s.get('curv','')},{s.get('curv_std','')},"
+                f"{s.get('target_error','')},{s.get('target_error_std','')}\n"
+            )
+    print(f"Per-scene CSV saved to {scene_csv_file}")
+
     csv_file = output_dir / "metrics.csv"
-    with open(csv_file, 'w') as f:
-        f.write("episode_idx,scene_id,instruction,fge,cr,plr,curv,target_error,num_obstacles,error\n")
+    with open(csv_file, "w", encoding="utf-8") as f:
+        f.write(
+            "episode_idx,scene_id,fge,cr,plr,curv,target_error,num_obstacles,pred_traj_len,gt_traj_len,error\n"
+        )
         for r in results:
-            instruction = r.get('instruction', '')[:50].replace(',', ' ').replace('\n', ' ')
-            f.write(f"{r.get('episode_idx', '')},{r.get('scene_id', '')},{instruction},"
-                   f"{r.get('fge', '')},{r.get('cr', '')},{r.get('plr', '')},{r.get('curv', '')},"
-                   f"{r.get('target_detection_error', '')},{r.get('num_obstacles', '')},"
-                   f"{r.get('error', '')}\n")
-    
+            f.write(
+                f"{r.get('episode_idx','')},{r.get('scene_id','')},{r.get('fge','')},{r.get('cr','')},{r.get('plr','')},{r.get('curv','')},"
+                f"{r.get('target_detection_error','')},{r.get('num_obstacles','')},{r.get('pred_traj_len','')},{r.get('gt_traj_len','')},"
+                f"{str(r.get('error','')).replace(',', ' ')}\n"
+            )
     print(f"CSV saved to {csv_file}")
 
 

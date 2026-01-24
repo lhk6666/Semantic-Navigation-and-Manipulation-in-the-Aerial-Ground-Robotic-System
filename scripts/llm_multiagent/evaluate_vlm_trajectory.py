@@ -1,39 +1,33 @@
 #!/usr/bin/env python3
-"""
-VLM Direct Trajectory Evaluation Script (Multi-threaded)
+"""Minimal VLM-direct-trajectory evaluation (multi-threaded, Vertex-only).
 
-This script evaluates the pure VLM trajectory generation baseline.
-Unlike VLM+Planner, this approach directly asks the VLM to generate
-a complete collision-free trajectory from start to goal.
+Pipeline per episode:
+    1) Load semantic-map image + GT start/goal/trajectory from Zarr
+    2) Call VLMTrajectoryPlanner.generate_trajectory(image, instruction, start)
+    3) Compute metrics and save JSON/CSV
 
-Comparison:
-- VLM+Planner: VLM detects target → Traditional planner generates path
-- VLM Trajectory: VLM directly generates the complete trajectory
-
-Features:
-- Multi-threaded VLM calls for faster evaluation
-- Automatic retry on errors
-- Checkpoint saving for resuming interrupted runs
+Notes:
+    - Intentionally minimal: no checkpointing, no visualization, no heavy retry/backoff.
+    - Multi-threaded is kept, but VLM requests are globally serialized and rate-limited
+        (e.g., start a request every 2s) to avoid burst/concurrency issues.
+    - Backend is forced to Vertex AI only.
 """
 
-import os
-import sys
-import json
-import zarr
-import numpy as np
-import cv2
-from pathlib import Path
-from tqdm import tqdm
 import argparse
-from dataclasses import dataclass, asdict
-from typing import List, Tuple, Optional, Dict, Any
-import time
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend for threading
-import matplotlib.pyplot as plt
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import importlib.util
+import json
+import re
+import sys
 import threading
-import traceback
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import zarr
+from tqdm import tqdm
 
 # Add paths for imports
 script_dir = Path(__file__).resolve().parent
@@ -46,151 +40,155 @@ from vlm_trajectory_planner import VLMTrajectoryPlanner
 # Thread-local storage for planners (each thread gets its own instance)
 thread_local = threading.local()
 
+# Global gate: do not send concurrent requests; also enforce a minimum interval
+# between starting requests.
+_REQUEST_LOCK = threading.Lock()
+_NEXT_REQUEST_TIME = 0.0
 
-def get_vlm_trajectory_planner(num_waypoints: int = 16):
-    """Get thread-local VLM trajectory planner instance"""
-    if not hasattr(thread_local, 'vlm_traj_planner'):
+
+def _guarded_vlm_call(fn, *, request_interval_sec: float):
+    """Run one VLM call under a global lock and min-start-interval."""
+    global _NEXT_REQUEST_TIME
+    interval = max(0.0, float(request_interval_sec))
+    with _REQUEST_LOCK:
+        now = time.monotonic()
+        wait_s = _NEXT_REQUEST_TIME - now
+        if wait_s > 0:
+            time.sleep(wait_s)
+        # Reserve the next slot *before* executing, to maintain spacing.
+        _NEXT_REQUEST_TIME = time.monotonic() + interval
+        return fn()
+
+
+def get_vlm_trajectory_planner(num_waypoints: int) -> VLMTrajectoryPlanner:
+    """Get thread-local VLM trajectory planner instance."""
+    if not hasattr(thread_local, "vlm_traj_planner"):
         thread_local.vlm_traj_planner = VLMTrajectoryPlanner(num_waypoints=num_waypoints)
+
+        # Force Vertex-only (fail fast if config switches backend).
+        backend = getattr(thread_local.vlm_traj_planner, "llm_backend", "vertexai")
+        if str(backend).lower() != "vertexai":
+            raise RuntimeError(
+                f"This evaluator requires Vertex AI backend, got llm_backend={backend}. "
+                "Update config.yaml to use Vertex (remove/set llm_backend: vertexai)."
+            )
     return thread_local.vlm_traj_planner
 
 
-# Standard number of waypoints for fair curvature comparison
-STANDARD_NUM_WAYPOINTS = 20
+def _load_flowvla_trajectory_metrics_module():
+    """Load FlowVLA's shared trajectory_metrics.py to avoid metric drift."""
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / "scripts" / "test" / "trajectory_metrics.py"
+        if candidate.exists():
+            spec = importlib.util.spec_from_file_location("flowvla_trajectory_metrics", str(candidate))
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Failed to load spec for {candidate}")
+            module = importlib.util.module_from_spec(spec)
+            # Python 3.12 dataclasses expects the module to be registered.
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            return module
+    raise FileNotFoundError(
+        "Could not locate FlowVLA/scripts/test/trajectory_metrics.py from this script location."
+    )
 
 
-def resample_trajectory(traj: np.ndarray, num_points: int) -> np.ndarray:
-    """
-    Resample trajectory to fixed number of points using linear interpolation.
-    This ensures fair comparison of curvature across different methods.
-    
-    Args:
-        traj: Original trajectory [N, 2]
-        num_points: Target number of points
-    
-    Returns:
-        Resampled trajectory [num_points, 2]
-    """
-    if len(traj) < 2:
-        return traj
-    
-    if len(traj) == num_points:
-        return traj
-    
-    # Compute cumulative arc length
-    diffs = np.diff(traj, axis=0)
-    segment_lengths = np.linalg.norm(diffs, axis=1)
-    cumulative_length = np.concatenate([[0], np.cumsum(segment_lengths)])
-    total_length = cumulative_length[-1]
-    
-    if total_length < 1e-8:
-        # Degenerate trajectory (all points same)
-        return np.tile(traj[0], (num_points, 1))
-    
-    # Generate uniform samples along arc length
-    target_lengths = np.linspace(0, total_length, num_points)
-    
-    # Interpolate
-    resampled = np.zeros((num_points, 2))
-    for i, target_len in enumerate(target_lengths):
-        # Find segment containing this length
-        idx = np.searchsorted(cumulative_length, target_len, side='right') - 1
-        idx = np.clip(idx, 0, len(traj) - 2)
-        
-        # Interpolate within segment
-        seg_start_len = cumulative_length[idx]
-        seg_len = segment_lengths[idx] if idx < len(segment_lengths) else 1e-8
-        
-        if seg_len < 1e-8:
-            t = 0
-        else:
-            t = (target_len - seg_start_len) / seg_len
-        t = np.clip(t, 0, 1)
-        
-        resampled[i] = traj[idx] * (1 - t) + traj[idx + 1] * t
-    
-    return resampled
+_FLOWVLA_METRICS = _load_flowvla_trajectory_metrics_module()
+TrajectoryMetrics = _FLOWVLA_METRICS.TrajectoryMetrics
+STANDARD_NUM_WAYPOINTS = _FLOWVLA_METRICS.STANDARD_NUM_WAYPOINTS
 
 
-class TrajectoryMetrics:
-    """
-    Trajectory evaluation metrics (same as HMRS/scripts/test/metrics.py)
-    - FGE: Final Goal Error (Euclidean distance to goal)
-    - CR: Collision Rate (1 if any point hits obstacle, 0 otherwise)
-    - PLR: Path Length Ratio (pred_length / gt_length)
-    - Curv: Curvature (mean absolute angle change between segments)
-    
-    Note: Curvature is computed on resampled trajectory (STANDARD_NUM_WAYPOINTS points)
-    for fair comparison across methods with different waypoint counts.
-    """
-    def __init__(self, pred_traj: np.ndarray, gt_traj: np.ndarray, 
-                 goal_pos: np.ndarray, obstacle_mask: Optional[np.ndarray] = None):
-        self.pred_traj = np.array(pred_traj)
-        self.gt_traj = np.array(gt_traj)
-        self.goal_pos = np.array(goal_pos)
-        self.obstacle_mask = obstacle_mask  # (H, W) binary mask, 1=obstacle
-        
-    def final_goal_error(self) -> float:
-        """FGE: Euclidean distance from final position to goal"""
-        if len(self.pred_traj) == 0:
-            return float('inf')
-        return float(np.linalg.norm(self.pred_traj[-1] - self.goal_pos))
-    
-    def collision_rate(self) -> float:
-        """CR: 1.0 if trajectory collides with obstacle, 0.0 otherwise"""
-        if self.obstacle_mask is None:
-            return 0.0
-        H, W = self.obstacle_mask.shape
-        for pt in self.pred_traj:
-            # Convert normalized [0,1] to pixel coordinates
-            cx = int(pt[0] * W)
-            cy = int(pt[1] * H)
-            # Clamp to valid range
-            cx = np.clip(cx, 0, W - 1)
-            cy = np.clip(cy, 0, H - 1)
-            if self.obstacle_mask[cy, cx] == 1:
-                return 1.0
-        return 0.0
-    
-    def path_length_ratio(self) -> float:
-        """PLR: pred_path_length / gt_path_length"""
-        if len(self.pred_traj) < 2 or len(self.gt_traj) < 2:
-            return 1.0
-        pred_len = self._compute_path_length(self.pred_traj)
-        gt_len = self._compute_path_length(self.gt_traj)
-        return float(pred_len / gt_len) if gt_len > 1e-6 else 1.0
-    
-    def curvature(self, num_points: int = STANDARD_NUM_WAYPOINTS) -> float:
-        """Curv: Mean absolute angle change between consecutive segments (radians)
-        
-        Note: Trajectory is resampled to num_points for fair comparison.
-        """
-        # Resample to standard number of points for fair comparison
-        resampled_traj = resample_trajectory(self.pred_traj, num_points)
-        return self._compute_curvature(resampled_traj)
-    
-    def _compute_path_length(self, path: np.ndarray) -> float:
-        """Compute total path length"""
-        if len(path) < 2:
-            return 0.0
-        return float(np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1)))
-    
-    def _compute_curvature(self, path: np.ndarray) -> float:
-        """Compute mean curvature as angle change between segments"""
-        if len(path) < 3:
-            return 0.0
-        # Compute direction vectors
-        vectors = path[1:] - path[:-1]
-        norms = np.linalg.norm(vectors, axis=1)
-        valid = norms > 1e-6
-        vectors = vectors[valid]
-        if len(vectors) < 2:
-            return 0.0
-        # Compute angles
-        angles = np.arctan2(vectors[:, 1], vectors[:, 0])
-        # Compute angle differences, wrapped to [-pi, pi]
-        diffs = angles[1:] - angles[:-1]
-        diffs = (diffs + np.pi) % (2 * np.pi) - np.pi
-        return float(np.mean(np.abs(diffs)))
+def scene_group_id(scene_id: str) -> str:
+    """Group scene variants like scene700_01/scene700_02 into scene700."""
+    if not scene_id:
+        return "unknown"
+    s = str(scene_id).strip()
+    s = s.split("/")[-1].split("\\")[-1]
+    m = re.match(r"^(scene\d+)(?:[_-]\d+)?$", s)
+    if m:
+        return m.group(1)
+    parts = re.split(r"[_-]", s)
+    if parts and re.fullmatch(r"scene\d+", parts[0]):
+        return parts[0]
+    m = re.match(r"^(scene\d+)", s)
+    if m:
+        return m.group(1)
+    return s
+
+
+def compute_per_scene_summary(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    valid = [r for r in results if not r.get("error") and r.get("fge") != float("inf")]
+    scene_results: Dict[str, List[Dict[str, Any]]] = {}
+    for r in valid:
+        sid = scene_group_id(r.get("scene_id", "unknown"))
+        scene_results.setdefault(sid, []).append(r)
+
+    def _mean(xs: List[float]) -> Optional[float]:
+        return float(np.mean(xs)) if xs else None
+
+    def _std(xs: List[float]) -> Optional[float]:
+        return float(np.std(xs)) if xs else None
+
+    summary: List[Dict[str, Any]] = []
+    for sid, scene_res in sorted(scene_results.items()):
+        fge_vals = [float(x["fge"]) for x in scene_res]
+        cr_vals = [float(x["cr"]) for x in scene_res]
+        plr_vals = [float(x["plr"]) for x in scene_res]
+        curv_vals = [float(x["curv"]) for x in scene_res]
+        tgt_errs = [
+            float(x["target_detection_error"])
+            for x in scene_res
+            if x.get("target_detection_error") is not None
+        ]
+
+        summary.append(
+            {
+                "scene_id": sid,
+                "num_episodes": int(len(scene_res)),
+                "fge": _mean(fge_vals),
+                "fge_std": _std(fge_vals),
+                "cr": _mean(cr_vals),
+                "cr_std": _std(cr_vals),
+                "plr": _mean(plr_vals),
+                "plr_std": _std(plr_vals),
+                "curv": _mean(curv_vals),
+                "curv_std": _std(curv_vals),
+                "target_error": _mean(tgt_errs),
+                "target_error_std": _std(tgt_errs),
+            }
+        )
+    return summary
+
+
+def postprocess_existing_results(*, results_path: Path, output_dir: Path, inplace: bool) -> None:
+    with open(results_path, "r", encoding="utf-8") as f:
+        blob = json.load(f)
+    episode_results = blob.get("episode_results") or []
+    if not isinstance(episode_results, list):
+        raise ValueError("results.json missing 'episode_results' list")
+
+    per_scene = compute_per_scene_summary(episode_results)
+    blob["per_scene"] = per_scene
+
+    scene_csv_file = output_dir / "scene_metrics.csv"
+    with open(scene_csv_file, "w", encoding="utf-8") as f:
+        f.write("scene_id,num_episodes,fge,fge_std,cr,cr_std,plr,plr_std,curv,curv_std,target_error,target_error_std\n")
+        for s in per_scene:
+            f.write(
+                f"{s.get('scene_id','')},{s.get('num_episodes','')},"
+                f"{s.get('fge','')},{s.get('fge_std','')},"
+                f"{s.get('cr','')},{s.get('cr_std','')},"
+                f"{s.get('plr','')},{s.get('plr_std','')},"
+                f"{s.get('curv','')},{s.get('curv_std','')},"
+                f"{s.get('target_error','')},{s.get('target_error_std','')}\n"
+            )
+    print(f"Per-scene CSV saved to {scene_csv_file}")
+
+    out_path = results_path if inplace else (output_dir / "results_postprocessed.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(blob, f, indent=2)
+    print(f"Postprocessed results saved to {out_path}")
 
 
 @dataclass
@@ -329,416 +327,283 @@ class DPZarrDataset:
         )
 
 
-def evaluate_single_episode(episode: EpisodeData, num_waypoints: int = 16,
-                           max_retries: int = 3) -> Dict[str, Any]:
-    """
-    Evaluate a single episode using VLM direct trajectory generation
-    VLM only receives: image + instruction + start position (NO goal)
-    """
-    result = {
-        'episode_idx': episode.episode_idx,
-        'scene_id': episode.scene_id,
-        'instruction': episode.instruction,
-        'target_category': episode.target_category,
-        'direction': episode.direction,
-        'fge': float('inf'),
-        'cr': 0.0,
-        'plr': 1.0,
-        'curv': 0.0,
-        'target_detection_error': None,  # Error between VLM-detected target and GT goal
-        'vlm_target': None,
-        'vlm_reasoning': None,
-        'vlm_error': None,
-        'planner_success': False,
-        'error': None,
-        'retries': 0,
-        'has_mask': episode.obstacle_mask is not None
+def evaluate_single_episode(
+    episode: EpisodeData,
+    *,
+    num_waypoints: int,
+    request_interval_sec: float,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "episode_idx": episode.episode_idx,
+        "scene_id": episode.scene_id,
+        "instruction": episode.instruction,
+        "target_category": episode.target_category,
+        "direction": episode.direction,
+        "has_mask": episode.obstacle_mask is not None,
+        "planner_success": False,
+        "error": None,
+        "vlm_error": None,
+        "vlm_target": None,
+        "target_detection_error": None,
+        "fge": float("inf"),
+        "cr": 0.0,
+        "plr": 1.0,
+        "curv": 0.0,
+        "pred_traj_len": 0,
+        "gt_traj_len": int(len(episode.gt_trajectory)),
     }
-    
-    for attempt in range(max_retries):
-        try:
-            # Get thread-local planner
-            planner = get_vlm_trajectory_planner(num_waypoints)
-            
-            # Only use GT start - VLM must identify goal from instruction
-            start = episode.start
-            
-            # Generate trajectory directly with VLM (NO goal provided)
-            vlm_result = planner.generate_trajectory(
-                image=episode.image,
-                instruction=episode.instruction,
-                start=start,
-                add_grid=True
-            )
-            
-            result['vlm_reasoning'] = vlm_result.get('reasoning', '')
-            result['vlm_error'] = vlm_result.get('error')
-            
-            # Get VLM-identified target
-            if vlm_result.get('target'):
-                vlm_target = vlm_result['target']
-                result['vlm_target'] = [vlm_target['x'], vlm_target['y']]
-                # Calculate target detection error (how well VLM understood the instruction)
-                pred_target = np.array([vlm_target['x'], vlm_target['y']])
-                result['target_detection_error'] = float(np.linalg.norm(pred_target - episode.goal))
-            
-            # Get trajectory
-            trajectory = np.array(vlm_result['trajectory'])
-            
-            if len(trajectory) == 0:
-                raise ValueError("Empty trajectory returned")
-            
-            result['planner_success'] = True
-            
-            # Compute metrics
-            metrics = TrajectoryMetrics(
-                pred_traj=trajectory,
-                gt_traj=episode.gt_trajectory,
-                goal_pos=episode.goal,
-                obstacle_mask=episode.obstacle_mask
-            )
-            
-            result['fge'] = metrics.final_goal_error()
-            result['cr'] = metrics.collision_rate()
-            result['plr'] = metrics.path_length_ratio()
-            result['curv'] = metrics.curvature()
-            result['pred_traj_len'] = len(trajectory)
-            result['gt_traj_len'] = len(episode.gt_trajectory)
-            result['retries'] = attempt
-            
-            # Store trajectory for visualization
-            result['pred_trajectory'] = trajectory.tolist()
-            
-            return result
-            
-        except Exception as e:
-            result['retries'] = attempt + 1
-            result['error'] = str(e)
-            if attempt < max_retries - 1:
-                time.sleep(1 * (attempt + 1))
-            else:
-                traceback.print_exc()
-    
-    return result
 
+    try:
+        planner = get_vlm_trajectory_planner(num_waypoints=num_waypoints)
+        start = episode.start
 
-def visualize_episode(episode: EpisodeData, result: Dict[str, Any], 
-                     output_path: Path):
-    """Visualize episode with predicted and GT trajectories"""
-    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-    
-    # Show image
-    ax.imshow(episode.image)
-    
-    h, w = episode.image.shape[:2]
-    
-    # Plot GT trajectory (blue)
-    gt_traj = episode.gt_trajectory
-    gt_px = gt_traj * np.array([w, h])
-    ax.plot(gt_px[:, 0], gt_px[:, 1], 'b-', linewidth=2, label='GT', alpha=0.7)
-    ax.scatter(gt_px[0, 0], gt_px[0, 1], c='blue', s=100, marker='o', zorder=5)
-    ax.scatter(gt_px[-1, 0], gt_px[-1, 1], c='blue', s=100, marker='*', zorder=5)
-    
-    # Plot predicted trajectory (red)
-    if result.get('pred_trajectory'):
-        pred_traj = np.array(result['pred_trajectory'])
-        pred_px = pred_traj * np.array([w, h])
-        ax.plot(pred_px[:, 0], pred_px[:, 1], 'r-', linewidth=2, label='VLM Pred', alpha=0.7)
-        ax.scatter(pred_px[0, 0], pred_px[0, 1], c='red', s=100, marker='o', zorder=5)
-        ax.scatter(pred_px[-1, 0], pred_px[-1, 1], c='red', s=100, marker='*', zorder=5)
-    
-    # Plot start and goal markers
-    start_px = episode.start * np.array([w, h])
-    goal_px = episode.goal * np.array([w, h])
-    ax.scatter(start_px[0], start_px[1], c='green', s=200, marker='s', 
-              label='Start', zorder=10, edgecolors='black', linewidths=2)
-    ax.scatter(goal_px[0], goal_px[1], c='yellow', s=200, marker='D', 
-              label='Goal', zorder=10, edgecolors='black', linewidths=2)
-    
-    # Title with metrics
-    title = f"Episode {episode.episode_idx}: {episode.instruction[:50]}..."
-    title += f"\nFGE={result.get('fge', 0):.4f}, CR={result.get('cr', 0)*100:.0f}%, "
-    title += f"PLR={result.get('plr', 1):.2f}, Curv={result.get('curv', 0):.3f}"
-    ax.set_title(title, fontsize=10)
-    
-    ax.legend(loc='upper right')
-    ax.axis('off')
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
+        def _call():
+            return planner.generate_trajectory(image=episode.image, instruction=episode.instruction, start=start)
 
+        vlm_result = _guarded_vlm_call(_call, request_interval_sec=request_interval_sec)
+        if not isinstance(vlm_result, dict):
+            raise ValueError("VLM returned non-dict")
 
-def save_checkpoint(results: List[Dict], output_dir: Path, 
-                   checkpoint_name: str = "checkpoint.json"):
-    """Save intermediate results"""
-    checkpoint_path = output_dir / checkpoint_name
-    # Remove pred_trajectory from checkpoint to save space
-    results_to_save = []
-    for r in results:
-        r_copy = r.copy()
-        r_copy.pop('pred_trajectory', None)
-        results_to_save.append(r_copy)
-    with open(checkpoint_path, 'w') as f:
-        json.dump(results_to_save, f)
+        result["vlm_error"] = vlm_result.get("error")
+        if vlm_result.get("error"):
+            raise ValueError(str(vlm_result.get("error")))
 
+        if isinstance(vlm_result.get("target"), dict):
+            tgt = vlm_result["target"]
+            if tgt.get("x") is not None and tgt.get("y") is not None:
+                result["vlm_target"] = [float(tgt["x"]), float(tgt["y"])]
+                pred_target = np.array([float(tgt["x"]), float(tgt["y"])], dtype=float)
+                result["target_detection_error"] = float(np.linalg.norm(pred_target - episode.goal))
 
-def load_checkpoint(output_dir: Path, 
-                   checkpoint_name: str = "checkpoint.json") -> List[Dict]:
-    """Load checkpoint if exists"""
-    checkpoint_path = output_dir / checkpoint_name
-    if checkpoint_path.exists():
-        with open(checkpoint_path, 'r') as f:
-            return json.load(f)
-    return []
+        traj = np.array(vlm_result.get("trajectory") or [], dtype=float)
+        if len(traj) == 0:
+            raise ValueError("Empty trajectory")
 
+        result["planner_success"] = True
+        result["pred_traj_len"] = int(len(traj))
 
-def main():
-    parser = argparse.ArgumentParser(description='Evaluate VLM Direct Trajectory (Multi-threaded)')
-    parser.add_argument('--dataset', type=str, 
-                       default='/media/dragon_llm/linux_ssd/vla_dataset_unified/val',
-                       help='Path to Zarr dataset')
-    parser.add_argument('--output_dir', type=str,
-                       default='vlm_trajectory_results_v2   ',
-                       help='Output directory')
-    parser.add_argument('--num_episodes', type=int, default=None,   
-                       help='Number of episodes (None = all)')
-    parser.add_argument('--num_waypoints', type=int, default=5,
-                       help='Number of waypoints to generate')
-    parser.add_argument('--num_workers', type=int, default=4,
-                       help='Number of parallel workers')
-    parser.add_argument('--max_retries', type=int, default=10,
-                       help='Max retries per episode')
-    parser.add_argument('--checkpoint_every', type=int, default=100,
-                       help='Save checkpoint every N episodes')
-    parser.add_argument('--resume', action='store_true',
-                       help='Resume from checkpoint')
-    parser.add_argument('--visualize_every', type=int, default=0,
-                       help='Visualize every N episodes (0 = disabled)')
+        metrics = TrajectoryMetrics(
+            pred_traj=traj,
+            gt_traj=episode.gt_trajectory,
+            goal_pos=episode.goal,
+            obstacle_mask=episode.obstacle_mask,
+        )
+        result["fge"] = metrics.final_goal_error(num_points=STANDARD_NUM_WAYPOINTS)
+        result["cr"] = metrics.collision_rate(num_points=STANDARD_NUM_WAYPOINTS)
+        result["plr"] = metrics.path_length_ratio(num_points=STANDARD_NUM_WAYPOINTS)
+        result["curv"] = metrics.curvature(num_points=STANDARD_NUM_WAYPOINTS)
+        return result
+
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Evaluate VLM Direct Trajectory (minimal, Vertex-only)")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="/media/dragon_llm/linux_ssd/vla_dataset_unified_static_v13/val",
+        help="Path to dataset root (contains episode_meta.json and dataset.zarr or direct zarr)",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="vlm_trajectory_results",
+        help="Output directory",
+    )
+    parser.add_argument(
+        "--num_episodes",
+        type=int,
+        default=None,
+        help="Number of episodes (default: all)",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help="Evaluate every N-th episode (default: 1, i.e., evaluate all)",
+    )
+    parser.add_argument(
+        "--num_waypoints",
+        type=int,
+        default=16,
+        help="Number of waypoints to generate",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=2,
+        help="Parallel workers",
+    )
+    parser.add_argument(
+        "--request_interval",
+        type=float,
+        default=2.0,
+        help="Minimum interval (seconds) between starting VLM requests (global)",
+    )
+    parser.add_argument(
+        "--postprocess",
+        action="store_true",
+        help="Postprocess an existing results.json under output_dir (no evaluation run)",
+    )
+    parser.add_argument(
+        "--results_json",
+        type=str,
+        default=None,
+        help="Path to results.json for postprocess (default: output_dir/results.json)",
+    )
+    parser.add_argument(
+        "--inplace",
+        action="store_true",
+        help="Overwrite the input results.json when postprocessing (default: write results_postprocessed.json)",
+    )
     args = parser.parse_args()
-    
-    # Create output directory
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    if args.visualize_every > 0:
-        vis_dir = output_dir / "visualizations"
-        vis_dir.mkdir(exist_ok=True)
-    
-    # Load dataset
+
+    if args.postprocess:
+        results_path = Path(args.results_json) if args.results_json else (output_dir / "results.json")
+        postprocess_existing_results(results_path=results_path, output_dir=output_dir, inplace=bool(args.inplace))
+        return
+
     print(f"Loading dataset from {args.dataset}")
     dataset = DPZarrDataset(args.dataset)
-    
-    # Determine episodes to evaluate
-    num_episodes = args.num_episodes or dataset.num_episodes
-    num_episodes = min(num_episodes, dataset.num_episodes)
-    
-    # Load checkpoint if resuming
-    results = []
-    completed_indices = set()
-    if args.resume:
-        results = load_checkpoint(output_dir)
-        completed_indices = {r['episode_idx'] for r in results}
-        print(f"Resumed from checkpoint: {len(completed_indices)} episodes completed")
-    
-    # Get episodes to process
-    episodes_to_process = [i for i in range(num_episodes) if i not in completed_indices]
-    
-    print(f"\n{'='*60}")
-    print("VLM DIRECT TRAJECTORY EVALUATION")
-    print(f"{'='*60}")
-    print(f"Method: VLM generates {args.num_waypoints} waypoints directly")
-    print(f"Episodes: {len(episodes_to_process)} remaining")
-    print(f"Workers: {args.num_workers}")
-    print(f"Max retries: {args.max_retries}")
-    print(f"{'='*60}\n")
-    
-    # Process with thread pool
-    processed_count = len(completed_indices)
-    error_count = 0
-    
+
+    num_episodes_limit = args.num_episodes or dataset.num_episodes
+    num_episodes_limit = min(num_episodes_limit, dataset.num_episodes)
+
+    stride = max(1, int(args.stride))
+    episode_indices = list(range(0, num_episodes_limit, stride))
+    num_eval = len(episode_indices)
+
+    print(
+        f"Evaluating {num_eval} episodes (stride={stride}, limit={num_episodes_limit}) with {args.num_workers} workers; "
+        f"request_interval={args.request_interval}s (global); "
+        f"curvature_resample={STANDARD_NUM_WAYPOINTS}"
+    )
+
+    results: List[Dict[str, Any]] = []
+    err_count = 0
+
     with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
-        # Submit all tasks
         future_to_idx = {}
-        for idx in episodes_to_process:
+        for idx in episode_indices:
             episode = dataset.get_episode(idx)
-            future = executor.submit(
-                evaluate_single_episode, 
-                episode, 
-                args.num_waypoints,
-                args.max_retries
+            fut = executor.submit(
+                evaluate_single_episode,
+                episode,
+                num_waypoints=args.num_waypoints,
+                request_interval_sec=args.request_interval,
             )
-            future_to_idx[future] = idx
-        
-        # Process completed tasks with progress bar
-        with tqdm(total=len(episodes_to_process), initial=0) as pbar:
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    result = future.result()
-                    results.append(result)
-                    
-                    # Count as error only if planning actually failed (not just had retries)
-                    if not result.get('planner_success', False):
-                        error_count += 1
-                    
-                    processed_count += 1
-                    
-                    # Update progress bar
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        'errors': error_count,
-                        'fge': f"{result.get('fge', 0):.3f}" if result.get('fge') != float('inf') else 'inf',
-                        'cr': f"{result.get('cr', 0)*100:.0f}%"
-                    })
-                    
-                    # Visualize if requested
-                    if args.visualize_every > 0 and idx % args.visualize_every == 0:
-                        episode = dataset.get_episode(idx)
-                        vis_path = output_dir / "visualizations" / f"episode_{idx:05d}.png"
-                        visualize_episode(episode, result, vis_path)
-                    
-                    # Save checkpoint
-                    if processed_count % args.checkpoint_every == 0:
-                        save_checkpoint(results, output_dir)
-                        
-                except Exception as e:
-                    print(f"\nFatal error on episode {idx}: {e}")
-                    error_count += 1
-                    results.append({
-                        'episode_idx': idx,
-                        'error': str(e),
-                        'fge': float('inf'),
-                        'cr': 0.0,
-                        'plr': 1.0,
-                        'curv': 0.0
-                    })
-    
-    # Final checkpoint
-    save_checkpoint(results, output_dir)
-    
-    # Compute aggregate metrics
-    valid_results = [r for r in results if r.get('fge') != float('inf')]
-    
-    fge_values = [r['fge'] for r in valid_results]
-    cr_values = [r['cr'] for r in valid_results]
-    plr_values = [r['plr'] for r in valid_results]
-    curv_values = [r['curv'] for r in valid_results]
-    target_errors = [r['target_detection_error'] for r in valid_results 
-                    if r.get('target_detection_error') is not None]
-    mask_count = sum(1 for r in valid_results if r.get('has_mask', False))
-    
+            future_to_idx[fut] = idx
+
+        with tqdm(total=num_eval, desc="Episodes", dynamic_ncols=True) as pbar:
+            for fut in as_completed(future_to_idx):
+                r = fut.result()
+                results.append(r)
+                if r.get("error"):
+                    err_count += 1
+                pbar.update(1)
+
+    results.sort(key=lambda x: int(x.get("episode_idx", 0)))
+
+    valid = [r for r in results if not r.get("error") and r.get("fge") != float("inf")]
+    mask_count = sum(1 for r in valid if r.get("has_mask"))
+
+    def _mean(xs: List[float]) -> Optional[float]:
+        return float(np.mean(xs)) if xs else None
+
+    def _std(xs: List[float]) -> Optional[float]:
+        return float(np.std(xs)) if xs else None
+
+    fge_vals = [float(r["fge"]) for r in valid]
+    cr_vals = [float(r["cr"]) for r in valid]
+    plr_vals = [float(r["plr"]) for r in valid]
+    curv_vals = [float(r["curv"]) for r in valid]
+    tgt_errs = [
+        float(r["target_detection_error"])
+        for r in valid
+        if r.get("target_detection_error") is not None
+    ]
+
     print("\n" + "=" * 60)
-    print("RESULTS SUMMARY - VLM DIRECT TRAJECTORY")
+    print("RESULTS SUMMARY")
     print("=" * 60)
     print(f"Total episodes: {len(results)}")
-    print(f"Valid episodes: {len(valid_results)}")
-    print(f"Failed episodes: {error_count}")
-    print(f"Episodes with mask: {mask_count}/{len(valid_results)}")
-    print(f"\nTrajectory Metrics:")
-    print(f"  FGE  (Final Goal Error):  {np.mean(fge_values):.4f} ± {np.std(fge_values):.4f}")
-    print(f"  CR   (Collision Rate):    {np.mean(cr_values)*100:.2f}%")
-    print(f"  PLR  (Path Length Ratio): {np.mean(plr_values):.4f} ± {np.std(plr_values):.4f}")
-    print(f"  Curv (Curvature):         {np.mean(curv_values):.4f} ± {np.std(curv_values):.4f}")
-    
-    # Target detection metrics (how well VLM understands instruction)
-    if target_errors:
-        print(f"\nVLM Target Detection (instruction understanding):")
-        print(f"  Target Error:    {np.mean(target_errors):.4f} ± {np.std(target_errors):.4f}")
-        print(f"  Detection Rate:  {len(target_errors)/len(valid_results)*100:.1f}%")
-    
-    # Per-scene results
-    scene_results = {}
-    for r in valid_results:
-        scene_id = r.get('scene_id', 'unknown')
-        if scene_id not in scene_results:
-            scene_results[scene_id] = []
-        scene_results[scene_id].append(r)
-    
-    print("\n" + "=" * 60)
-    print("PER-SCENE RESULTS")
-    print("=" * 60)
-    
-    scene_summary = []
-    for scene_id, scene_res in sorted(scene_results.items()):
-        scene_fge = np.mean([r['fge'] for r in scene_res])
-        scene_cr = np.mean([r['cr'] for r in scene_res])
-        scene_curv = np.mean([r['curv'] for r in scene_res])
-        print(f"{scene_id}: FGE={scene_fge:.4f}, CR={scene_cr*100:.1f}%, Curv={scene_curv:.4f}, N={len(scene_res)}")
-        scene_summary.append({
-            'scene_id': scene_id,
-            'fge': float(scene_fge),
-            'cr': float(scene_cr),
-            'curv': float(scene_curv),
-            'num_episodes': len(scene_res)
-        })
-    
-    # Save final results
+    print(f"Valid episodes: {len(valid)}")
+    print(f"Errors: {err_count}")
+    print(f"Valid episodes with mask: {mask_count}/{len(valid)}")
+    if valid:
+        print(f"FGE  : {_mean(fge_vals):.4f} ± {_std(fge_vals):.4f}")
+        print(f"CR   : {_mean(cr_vals) * 100.0:.2f}%")
+        print(f"PLR  : {_mean(plr_vals):.4f} ± {_std(plr_vals):.4f}")
+        print(f"Curv : {_mean(curv_vals):.4f} ± {_std(curv_vals):.4f}")
+    if tgt_errs:
+        print(f"Target error: {_mean(tgt_errs):.4f} ± {_std(tgt_errs):.4f}")
+
     results_file = output_dir / "results.json"
-    
-    # Clean results for saving (remove large trajectory data)
-    results_to_save = []
-    for r in results:
-        r_copy = r.copy()
-        r_copy.pop('pred_trajectory', None)
-        results_to_save.append(r_copy)
-    
-    with open(results_file, 'w') as f:
-        json.dump({
-            'config': {
-                'method': 'VLM Direct Trajectory (no goal input)',
-                'description': 'VLM receives image + instruction + start only, must identify target',
-                'dataset': args.dataset,
-                'num_episodes': len(results),
-                'num_waypoints': args.num_waypoints,
-                'num_workers': args.num_workers,
-                'max_retries': args.max_retries
+    with open(results_file, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "config": {
+                    "dataset": args.dataset,
+                    "num_episodes": num_eval,
+                    "num_episodes_limit": int(num_episodes_limit),
+                    "stride": int(stride),
+                    "num_waypoints": args.num_waypoints,
+                    "num_workers": args.num_workers,
+                    "request_interval": float(args.request_interval),
+                    "curvature_resample": int(STANDARD_NUM_WAYPOINTS),
+                },
+                "overall": {
+                    "fge_mean": _mean(fge_vals),
+                    "fge_std": _std(fge_vals),
+                    "cr_mean": _mean(cr_vals),
+                    "plr_mean": _mean(plr_vals),
+                    "plr_std": _std(plr_vals),
+                    "curv_mean": _mean(curv_vals),
+                    "curv_std": _std(curv_vals),
+                    "target_error_mean": _mean(tgt_errs),
+                    "target_error_std": _std(tgt_errs),
+                    "num_valid": len(valid),
+                    "num_errors": err_count,
+                    "num_with_mask": mask_count,
+                },
+                "episode_results": results,
+                "per_scene": compute_per_scene_summary(results),
             },
-            'overall': {
-                'fge_mean': float(np.mean(fge_values)),
-                'fge_std': float(np.std(fge_values)),
-                'cr_mean': float(np.mean(cr_values)),
-                'plr_mean': float(np.mean(plr_values)),
-                'plr_std': float(np.std(plr_values)),
-                'curv_mean': float(np.mean(curv_values)),
-                'curv_std': float(np.std(curv_values)),
-                'target_detection_error_mean': float(np.mean(target_errors)) if target_errors else None,
-                'target_detection_error_std': float(np.std(target_errors)) if target_errors else None,
-                'target_detection_rate': len(target_errors)/len(valid_results) if valid_results else 0,
-                'num_valid': len(valid_results),
-                'num_errors': error_count,
-                'num_with_mask': mask_count
-            },
-            'per_scene': scene_summary,
-            'episode_results': results_to_save
-        }, f, indent=2)
-    
-    print(f"\nResults saved to {results_file}")
-    
-    # Save CSV
+            f,
+            indent=2,
+        )
+    print(f"Results saved to {results_file}")
+
+    scene_csv_file = output_dir / "scene_metrics.csv"
+    per_scene = compute_per_scene_summary(results)
+    with open(scene_csv_file, "w", encoding="utf-8") as f:
+        f.write("scene_id,num_episodes,fge,fge_std,cr,cr_std,plr,plr_std,curv,curv_std,target_error,target_error_std\n")
+        for s in per_scene:
+            f.write(
+                f"{s.get('scene_id','')},{s.get('num_episodes','')},"
+                f"{s.get('fge','')},{s.get('fge_std','')},"
+                f"{s.get('cr','')},{s.get('cr_std','')},"
+                f"{s.get('plr','')},{s.get('plr_std','')},"
+                f"{s.get('curv','')},{s.get('curv_std','')},"
+                f"{s.get('target_error','')},{s.get('target_error_std','')}\n"
+            )
+    print(f"Per-scene CSV saved to {scene_csv_file}")
+
     csv_file = output_dir / "metrics.csv"
-    with open(csv_file, 'w') as f:
-        f.write("episode_idx,scene_id,instruction,fge,cr,plr,curv,target_error,vlm_target,vlm_error,error\n")
+    with open(csv_file, "w", encoding="utf-8") as f:
+        f.write("episode_idx,scene_id,fge,cr,plr,curv,target_error,pred_traj_len,gt_traj_len,error\n")
         for r in results:
-            instruction = r.get('instruction', '')[:50].replace(',', ' ').replace('\n', ' ')
-            vlm_target = r.get('vlm_target', '')
-            if vlm_target:
-                vlm_target = f"({vlm_target[0]:.3f};{vlm_target[1]:.3f})"
-            f.write(f"{r.get('episode_idx', '')},{r.get('scene_id', '')},{instruction},"
-                   f"{r.get('fge', '')},{r.get('cr', '')},{r.get('plr', '')},{r.get('curv', '')},"
-                   f"{r.get('target_detection_error', '')},{vlm_target},"
-                   f"{r.get('vlm_error', '')},{r.get('error', '')}\n")
-    
+            f.write(
+                f"{r.get('episode_idx','')},{r.get('scene_id','')},{r.get('fge','')},{r.get('cr','')},{r.get('plr','')},{r.get('curv','')},"
+                f"{r.get('target_detection_error','')},{r.get('pred_traj_len','')},{r.get('gt_traj_len','')},"
+                f"{str(r.get('error','')).replace(',', ' ')}\n"
+            )
     print(f"CSV saved to {csv_file}")
-    
-    # Print comparison hint
-    print("\n" + "=" * 60)
-    print("COMPARISON WITH OTHER METHODS")
-    print("=" * 60)
-    print("To compare with VLM+Planner baseline, run:")
-    print(f"  python evaluate_vlm_planner.py --dataset {args.dataset}")
-    print("\nTo compare with VLA model, run:")
-    print("  python -m diffusion_policy.scripts.test.run_test --checkpoint <path>")
 
 
 if __name__ == "__main__":

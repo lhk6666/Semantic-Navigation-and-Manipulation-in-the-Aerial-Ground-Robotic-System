@@ -21,11 +21,18 @@ import base64
 import json
 import time
 import yaml
+import re
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 
-import vertexai
-from vertexai.generative_models import GenerativeModel, SafetySetting, Part
+try:
+    import vertexai
+    from vertexai.generative_models import GenerativeModel, SafetySetting, Part
+except Exception:  # pragma: no cover
+    vertexai = None
+    GenerativeModel = None
+    SafetySetting = None
+    Part = None
 
 
 class VLMTrajectoryPlanner:
@@ -47,23 +54,67 @@ class VLMTrajectoryPlanner:
         cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
-        
-        vertexai.init(
-            project=cfg["project_id"],
-        )
+
+        self.cfg = cfg or {}
+        self.llm_backend = (self.cfg.get("llm_backend") or "vertexai").lower()
         
         self.num_waypoints = num_waypoints
+
+        self.max_output_tokens = int(self.cfg.get("vlm_traj_max_output_tokens", 8192))
+        self.allow_fallback = bool(self.cfg.get("vlm_traj_allow_fallback", True))
+
+        self.genai_client = None
+        self.genai_model = None
+
+        if self.llm_backend == "genai":
+            # Google GenAI (API key) backend (no Vertex AI)
+            api_key_env = str(self.cfg.get("genai_api_key_env", "GOOGLE_CLOUD_API_KEY") or "GOOGLE_CLOUD_API_KEY")
+            # Guardrail: don't let users paste the API key itself into YAML.
+            # Env var names should look like: [A-Za-z_][A-Za-z0-9_]*
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", api_key_env):
+                raise RuntimeError(
+                    "Invalid genai_api_key_env in config.yaml. "
+                    "It must be an environment variable NAME (e.g., GOOGLE_CLOUD_API_KEY), not the API key value."
+                )
+
+            api_key = os.environ.get(api_key_env)
+            if not api_key:
+                raise RuntimeError(
+                    f"Missing API key in environment variable {api_key_env}. "
+                    f"Export it (e.g., export {api_key_env}=... ) or change genai_api_key_env in config.yaml."
+                )
+            try:
+                from google import genai  # type: ignore
+            except Exception as e:
+                raise RuntimeError(
+                    "google-genai is not installed. Install it (pip install google-genai) "
+                    "or switch llm_backend back to vertexai."
+                ) from e
+
+            # Match the sample style (no Vertex AI)
+            self.genai_client = genai.Client(api_key=api_key)
+            self.genai_model = self.cfg.get("genai_model", "gemini-3-pro-preview")
+        else:
+            # Vertex AI backend
+            if vertexai is None or GenerativeModel is None:
+                raise RuntimeError(
+                    "vertexai SDK is not available. Install vertexai or set llm_backend: genai."
+                )
+
+            vertexai.init(project=self.cfg["project_id"], location=self.cfg["location"])
         
         # Use flash model for trajectory generation
-        self.model = GenerativeModel(
-            cfg["flash_model"],
-            system_instruction=self._get_system_prompt()
-        )
+        self.model = None
+        if self.llm_backend != "genai":
+            self.model = GenerativeModel(
+                self.cfg.get("flash_model"),
+                system_instruction=self._get_system_prompt(),
+            )
         
         self.generation_config = {
-            "max_output_tokens": 8192,  # Increased for full trajectory JSON
+            "max_output_tokens": self.max_output_tokens,
             "temperature": 0.0,  # Lower temperature for more consistent paths
-            "top_p": 0.0,
+            "top_p": 1.0,
             "response_mime_type": "application/json",  # Force JSON output
         }
         
@@ -85,80 +136,237 @@ class VLMTrajectoryPlanner:
                 threshold=SafetySetting.HarmBlockThreshold.OFF
             ),
         ]
+
+    def _extract_json_text(self, response_text: str) -> str:
+        text = (response_text or "").strip()
+
+        if "```json" in text:
+            try:
+                text = text.split("```json", 1)[1].split("```", 1)[0]
+            except Exception:
+                pass
+        elif "```" in text:
+            try:
+                text = text.split("```", 1)[1].split("```", 1)[0]
+            except Exception:
+                pass
+
+        text = text.strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            text = text[start : end + 1]
+        return text.strip()
+
+    def _repair_json_text(self, text: str) -> str:
+        t = (text or "").strip()
+
+        # Remove standalone commas on their own line.
+        t = re.sub(r"\n\s*,\s*\n", "\n", t)
+
+        # Remove trailing commas before closing braces/brackets.
+        t = re.sub(r",\s*([}\]])", r"\1", t)
+
+        # Truncate after the last closing brace and then balance braces/brackets.
+        last_brace = t.rfind("}")
+        if last_brace > 0:
+            t = t[: last_brace + 1]
+
+        open_brackets = t.count("[") - t.count("]")
+        open_braces = t.count("{") - t.count("}")
+        if open_brackets > 0:
+            t += "]" * open_brackets
+        if open_braces > 0:
+            t += "}" * open_braces
+
+        return t
+
+    def _looks_truncated(self, text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return True
+        # Common truncation tails we saw: ends mid-number or mid-string
+        if t.endswith(".") or t.endswith('"') or t.endswith("\\"):
+            return True
+        # If braces/brackets are imbalanced, it's likely truncated.
+        if t.count("{") != t.count("}"):
+            return True
+        if t.count("[") != t.count("]"):
+            return True
+        return False
+
+    def _infer_target_from_text(self, response_text: str) -> Optional[Dict[str, Any]]:
+        """Best-effort extraction of target even when JSON is truncated."""
+        if not response_text:
+            return None
+        m = re.search(
+            r'"target"\s*:\s*\{.*?"x"\s*:\s*([0-9]*\.?[0-9]+).*?"y"\s*:\s*([0-9]*\.?[0-9]+).*?\}',
+            response_text,
+            flags=re.S,
+        )
+        if not m:
+            return None
+        try:
+            x = float(np.clip(float(m.group(1)), 0, 1))
+            y = float(np.clip(float(m.group(2)), 0, 1))
+            name_m = re.search(r'"target"\s*:\s*\{.*?"name"\s*:\s*"([^"]+)"', response_text, flags=re.S)
+            name = name_m.group(1) if name_m else "unknown"
+            return {"name": name, "x": round(x, 2), "y": round(y, 2)}
+        except Exception:
+            return None
+
+    def _call_llm(self, image_bytes: bytes, prompt_text: str) -> str:
+        """Call configured LLM backend and return response text."""
+        if self.llm_backend == "genai":
+            from google.genai import types  # type: ignore
+
+            parts = []
+            # Image part
+            if hasattr(types.Part, "from_bytes"):
+                parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
+            else:
+                # Fallback for older google-genai versions
+                parts.append(types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=image_bytes)))
+
+            # Text part
+            if hasattr(types.Part, "from_text"):
+                parts.append(types.Part.from_text(text=prompt_text))
+            else:
+                parts.append(types.Part(text=prompt_text))
+
+            contents = [types.Content(role="user", parts=parts)]
+
+            # Optional knobs to match the sample template
+            use_search = bool(self.cfg.get("genai_use_google_search", False))
+            thinking_level = self.cfg.get("genai_thinking_level", None)
+
+            tools = None
+            if use_search:
+                # SDK casing varies; prefer googleSearch as in the sample.
+                try:
+                    tools = [types.Tool(googleSearch=types.GoogleSearch())]
+                except Exception:
+                    try:
+                        tools = [types.Tool(google_search=types.GoogleSearch())]
+                    except Exception:
+                        tools = None
+
+            cfg_kwargs = {
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "max_output_tokens": self.max_output_tokens,
+            }
+            if tools is not None:
+                cfg_kwargs["tools"] = tools
+
+            if thinking_level:
+                try:
+                    cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=str(thinking_level))
+                except Exception:
+                    pass
+
+            # Some SDK versions support forcing JSON mime type.
+            try:
+                cfg_kwargs["response_mime_type"] = "application/json"
+                gen_cfg = types.GenerateContentConfig(**cfg_kwargs)
+            except TypeError:
+                cfg_kwargs.pop("response_mime_type", None)
+                gen_cfg = types.GenerateContentConfig(**cfg_kwargs)
+
+            resp = self.genai_client.models.generate_content(
+                model=self.genai_model,
+                contents=contents,
+                config=gen_cfg,
+            )
+            return getattr(resp, "text", None) or str(resp)
+
+        # Vertex AI
+        contents = [
+            Part.from_data(data=image_bytes, mime_type="image/jpeg"),
+            Part.from_text(text=prompt_text),
+        ]
+        response = self.model.generate_content(
+            contents=contents,
+            generation_config=self.generation_config,
+            safety_settings=self.safety_settings,
+        )
+        return response.text
     
     def _get_system_prompt(self) -> str:
-        return f"""You are a robot trajectory planner analyzing TOP-DOWN VIEW (bird's eye view) semantic maps.
+        return f"""You are a robot navigation policy operating on a TOP-DOWN (bird’s-eye-view) RGB map and a natural-language instruction.
 
-The image shows a 2D floor plan from above with:
-- Different colored regions representing furniture and objects (tables, chairs, sofas, beds, etc.)
-- Dark/black regions are typically obstacles or walls
-- Lighter regions are typically navigable floor space
-- A GREEN dot marks the robot's current START position
+INPUTS
+- Image: a top-down RGB map (RGB-only; no explicit obstacle mask).
+- Text: (1) Instruction and (2) START coordinate in normalized image coordinates.
 
-Your task is to:
-1. UNDERSTAND the navigation instruction to identify the TARGET object/location
-2. GENERATE a smooth, collision-free trajectory from START to TARGET
+START (AUTHORITATIVE)
+- The robot START is provided in text.
+- The image may also show a green dot, but if there is any ambiguity, trust the text START.
 
-COORDINATE SYSTEM:
-- (0, 0) is the TOP-LEFT corner
-- (1, 1) is the BOTTOM-RIGHT corner
-- x increases LEFT to RIGHT
-- y increases TOP to BOTTOM
+COORDINATE SYSTEM (NORMALIZED)
+- (0.00, 0.00) is the TOP-LEFT corner of the image
+- (1.00, 1.00) is the BOTTOM-RIGHT corner
+- x increases left -> right; y increases top -> bottom
+- All output coordinates MUST have exactly 2 digits after the decimal (e.g., 0.37).
 
-INSTRUCTION UNDERSTANDING:
-- "left/right" refers to x-axis direction (left = smaller x, right = larger x)
-- "upper/top" means smaller y values, "lower/bottom" means larger y values
-- Pay attention to relative positions (e.g., "the table on the left" vs "the table on the right")
-- Identify the specific target object mentioned in the instruction
+GOAL
+Return a smooth 2D trajectory from START to a TARGET consistent with the instruction, while avoiding obstacles inferred from the RGB image.
 
-OUTPUT REQUIREMENTS:
-1. First identify the TARGET from the instruction
-2. Generate exactly {self.num_waypoints} waypoints
-3. First waypoint should be near the START position (green marker)
-4. Last waypoint should be at the TARGET location
-5. Waypoints should form a smooth path avoiding obstacles
-6. Keep reasonable spacing between consecutive waypoints
-7. Stay away from dark/obstacle regions
+MAP INTERPRETATION (RGB-ONLY)
+- There is no color-coded traversability. You MUST infer traversable vs obstacle regions from visual cues (e.g., occupied structures, walls, furniture-like shapes, cluttered regions, boundaries of open space).
+- When uncertain, be conservative: route through visually open, continuous regions and keep margins from occupied structures.
 
-Output ONLY a JSON object in this exact format:
+INSTRUCTION GROUNDING
+- Use the instruction to choose a target location on the map.
+- If the instruction mentions an object category (chair/table/etc.), attempt to locate a plausible instance from the RGB map using shape/position/context cues.
+- If multiple candidates exist, choose the one you judge most consistent with the instruction and overall scene layout.
+
+TARGET REQUIREMENTS (NO FALLBACK; MUST ANSWER)
+- You MUST always output a target with a valid (x,y) in [0.00, 1.00] x [0.00, 1.00].
+- If you are uncertain about the exact target, output your BEST GUESS anyway.
+- Indicate uncertainty in "notes" using short ASCII words (e.g., "best guess").
+
+TRAJECTORY REQUIREMENTS (STRICT)
+- Output exactly {self.num_waypoints} waypoints.
+- Waypoint #1 must be at START (exact match preferred; otherwise within 0.02 L2 distance).
+- Waypoint #{self.num_waypoints} must be at TARGET (exact match preferred; otherwise within 0.02 L2 distance).
+- All waypoints must satisfy: 0.00 <= x <= 1.00 and 0.00 <= y <= 1.00.
+- Avoid obstacles inferred from the RGB image (do not place waypoints on occupied structures).
+- Prefer smooth paths with gentle curvature; avoid zig-zags.
+
+WAYPOINT SPACING (SOFT)
+- Prefer roughly even spacing when feasible. Collision avoidance has higher priority.
+
+OUTPUT FORMAT (STRICT JSON ONLY)
+Return ONLY a valid JSON object with double quotes and no trailing commas. No extra text.
+
+Schema:
 {{
-    "target": {{"name": "identified target object", "x": 0.7, "y": 0.5}},
-    "trajectory": [
-        {{"x": 0.15, "y": 0.25}},
-        {{"x": 0.18, "y": 0.30}},
-        ... (exactly {self.num_waypoints} points total)
-    ],
-    "reasoning": "Brief explanation of target identification and path planning"
+  "target": {{"name": "<string>", "x": <float>, "y": <float>}},
+  "trajectory": [
+    {{"x": <float>, "y": <float>}},
+    ...
+  ],
+  "notes": "<max 25 words; ASCII only; no line breaks>"
 }}
 
-PLANNING STRATEGY:
-1. Read the instruction carefully to identify the target object
-2. Locate the target in the semantic map based on color/shape/position
-3. Find the start position (green marker)
-4. Identify obstacles (dark regions, furniture to avoid)
-5. Plan a smooth path from start to target, curving around obstacles"""
+NOTES (STRICT)
+- Use only letters/numbers/spaces in notes (no punctuation).
+- If target is uncertain, include "best guess".
+- If obstacle inference is uncertain, include "conservative".
+"""
 
-    def draw_markers(self, image: np.ndarray, start: np.ndarray,
-                     grid_size: int = 5) -> np.ndarray:
-        """
-        Draw start marker and optional grid on image
-        NOTE: No goal marker - VLM must identify target from instruction
-        
+    def draw_markers(self, image: np.ndarray, start: np.ndarray) -> np.ndarray:
+        """Draw start marker on image.
+
+        NOTE: No goal marker - VLM must identify target from instruction.
+
         Args:
             image: Input image (H, W, 3) BGR format
             start: Start position in normalized coords [0,1]
-            grid_size: Grid divisions (0 to disable)
         """
         img = image.copy()
         h, w = img.shape[:2]
-        
-        # Draw grid if requested
-        if grid_size > 0:
-            for i in range(1, grid_size):
-                x = int(w * i / grid_size)
-                cv2.line(img, (x, 0), (x, h), (128, 128, 128), 1)
-                y = int(h * i / grid_size)
-                cv2.line(img, (0, y), (w, y), (128, 128, 128), 1)
         
         # Draw start marker (green circle) - VLM needs to know where robot is
         start_px = (int(start[0] * w), int(start[1] * h))
@@ -171,15 +379,13 @@ PLANNING STRATEGY:
         
         return img
     
-    def prepare_image(self, image: np.ndarray, start: np.ndarray,
-                      add_grid: bool = True) -> str:
+    def prepare_image(self, image: np.ndarray, start: np.ndarray) -> str:
         """
         Prepare image for VLM with start marker only
         
         Args:
             image: Input image (H, W, 3) RGB format
             start: Start position [x, y] normalized [0,1]
-            add_grid: Whether to add coordinate grid
             
         Returns:
             base64 encoded JPEG string
@@ -188,23 +394,21 @@ PLANNING STRATEGY:
         img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         
         # Resize to reasonable size
-        target_size = 512
+        target_size = 384
         h, w = img_bgr.shape[:2]
         scale = target_size / max(h, w)
         new_w, new_h = int(w * scale), int(h * scale)
         img_resized = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
         
-        # Add start marker only (no goal marker)
-        grid_size = 5 if add_grid else 0
-        img_marked = self.draw_markers(img_resized, start, grid_size)
+        # Add start marker only 
+        img_marked = self.draw_markers(img_resized, start)
         
         # Encode to base64
         _, buffer = cv2.imencode('.jpeg', img_marked, [cv2.IMWRITE_JPEG_QUALITY, 90])
         return base64.b64encode(buffer).decode()
     
     def generate_trajectory(self, image: np.ndarray, instruction: str,
-                           start: np.ndarray,
-                           add_grid: bool = True) -> Dict[str, Any]:
+                           start: np.ndarray) -> Dict[str, Any]:
         """
         Generate a trajectory from start to target (VLM identifies target from instruction)
         
@@ -212,7 +416,6 @@ PLANNING STRATEGY:
             image: Input image (H, W, 3) RGB format
             instruction: Navigation instruction (VLM uses this to find target)
             start: Start position [x, y] normalized [0,1]
-            add_grid: Whether to add coordinate grid overlay
             
         Returns:
             Dictionary with:
@@ -221,14 +424,10 @@ PLANNING STRATEGY:
                 - reasoning: VLM's explanation
                 - error: Error message if failed
         """
-        img_base64 = self.prepare_image(image, start, add_grid)
-        
-        contents = [
-            Part.from_data(
-                data=base64.b64decode(img_base64),
-                mime_type="image/jpeg"
-            ),
-            Part.from_text(f"""This is a top-down semantic map of an indoor environment.
+        img_base64 = self.prepare_image(image, start)
+        image_bytes = base64.b64decode(img_base64)
+
+        prompt_text = f"""This is a top-down semantic map of an indoor environment.
 
 The GREEN dot marks the robot's current START position at approximately ({start[0]:.2f}, {start[1]:.2f}).
 
@@ -241,22 +440,30 @@ Your task:
 The path should:
 1. Start near the green marker (robot's position)
 2. End at the TARGET location (you must identify from instruction)
-3. Avoid all obstacles (dark regions, furniture)
+3. Avoid all obstacles
 4. Be smooth and efficient
 
-Output JSON with target info and trajectory array.""")
-        ]
+Output JSON with target info and trajectory array."""
+
         
-        max_retries = 3
+        max_retries = 2
+        last_result: Optional[Dict[str, Any]] = None
         for attempt in range(max_retries):
             try:
-                response = self.model.generate_content(
-                    contents=contents,
-                    generation_config=self.generation_config,
-                    safety_settings=self.safety_settings
-                )
-                
-                result = self._parse_response(response.text, start)
+                response_text = self._call_llm(image_bytes=image_bytes, prompt_text=prompt_text)
+
+                result = self._parse_response(response_text, start)
+                last_result = result
+
+                # If we detect truncation/malformed JSON, retry.
+                if result.get("error") and attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                if (not result.get("trajectory")) and attempt < max_retries - 1:
+                    # Empty trajectory is usually a parsing failure; retry once or twice.
+                    time.sleep(1)
+                    continue
+
                 return result
                 
             except Exception as e:
@@ -264,13 +471,35 @@ Output JSON with target info and trajectory array.""")
                 if attempt < max_retries - 1:
                     time.sleep(1)
                 else:
-                    # Return error - no fallback since we don't know the goal
+                    # Final failure
                     return {
                         "target": None,
                         "trajectory": [],
                         "reasoning": "",
-                        "error": str(e)
+                        "raw_response": None,
+                        "error": str(e),
                     }
+
+        # If we exhausted retries and allow fallback, try to infer target and return straight line.
+        if self.allow_fallback and last_result and last_result.get("raw_response"):
+            inferred = self._infer_target_from_text(last_result["raw_response"])
+            if inferred:
+                goal = np.array([inferred["x"], inferred["y"]])
+                return {
+                    "target": inferred,
+                    "trajectory": self._make_straight_line(start, goal),
+                    "reasoning": "fallback straight line due to truncated output",
+                    "raw_response": last_result.get("raw_response"),
+                    "error": last_result.get("error") or "truncated output",
+                }
+
+        return last_result or {
+            "target": None,
+            "trajectory": [],
+            "reasoning": "",
+            "raw_response": None,
+            "error": "Unknown failure",
+        }
     
     def _parse_response(self, response_text: str, start: np.ndarray) -> Dict[str, Any]:
         """Parse VLM response to extract target and trajectory"""
@@ -283,52 +512,39 @@ Output JSON with target info and trajectory array.""")
         }
         
         try:
-            text = response_text.strip()
+            text = self._extract_json_text(response_text)
+            if self._looks_truncated(text):
+                # Let caller retry rather than trying to parse partial JSON.
+                raise json.JSONDecodeError("Likely truncated JSON", text or "", max(0, len(text) - 1))
+
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                repaired = self._repair_json_text(text)
+                data = json.loads(repaired)
             
-            # Extract JSON from various formats
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0]
-            elif "```" in text:
-                parts = text.split("```")
-                if len(parts) >= 2:
-                    text = parts[1]
-            
-            text = text.strip()
-            
-            # Try to fix truncated JSON
-            if not text.endswith("}"):
-                # Find last complete trajectory point
-                last_brace = text.rfind("}")
-                if last_brace > 0:
-                    # Try to close the JSON properly
-                    text = text[:last_brace+1]
-                    # Count open brackets and close them
-                    open_brackets = text.count("[") - text.count("]")
-                    open_braces = text.count("{") - text.count("}")
-                    text += "]" * open_brackets + "}" * open_braces
-            
-            data = json.loads(text)
-            
-            # Extract target (VLM identified)
+            # Extract target
             if "target" in data and data["target"]:
                 target = data["target"]
                 if target.get("x") is not None and target.get("y") is not None:
+                    x = float(np.clip(target["x"], 0, 1))
+                    y = float(np.clip(target["y"], 0, 1))
                     result["target"] = {
                         "name": target.get("name", "unknown"),
-                        "x": float(np.clip(target["x"], 0, 1)),
-                        "y": float(np.clip(target["y"], 0, 1))
+                        "x": round(x, 2),
+                        "y": round(y, 2),
                     }
-            
+
             # Extract trajectory
             if "trajectory" in data and data["trajectory"]:
                 for pt in data["trajectory"]:
                     if pt.get("x") is not None and pt.get("y") is not None:
                         x = float(np.clip(pt["x"], 0, 1))
                         y = float(np.clip(pt["y"], 0, 1))
-                        result["trajectory"].append([x, y])
-            
-            # Extract reasoning
-            result["reasoning"] = data.get("reasoning", "")
+                        result["trajectory"].append([round(x, 2), round(y, 2)])
+
+            # Extract notes/reasoning (be robust)
+            result["reasoning"] = data.get("notes", data.get("reasoning", ""))
             
             # Validate and adjust trajectory length
             if len(result["trajectory"]) > 0:
@@ -346,6 +562,12 @@ Output JSON with target info and trajectory array.""")
                     result["trajectory"] = self._subsample_trajectory(
                         result["trajectory"], self.num_waypoints
                     )
+
+            # If target exists but trajectory missing, optionally generate a fallback.
+            if self.allow_fallback and result["target"] and len(result["trajectory"]) == 0:
+                goal = np.array([result["target"]["x"], result["target"]["y"]])
+                result["trajectory"] = self._make_straight_line(start, goal)
+                result["reasoning"] = (result.get("reasoning") or "") + " fallback"
                 
         except json.JSONDecodeError as e:
             result["error"] = f"JSON parse error: {e}"
@@ -414,17 +636,29 @@ Output JSON with target info and trajectory array.""")
 
 if __name__ == "__main__":
     import zarr
+    from pathlib import Path
     
     # Test with dataset
-    dataset_path = '/media/dragon_llm/linux_ssd/vla_dp_224/val'
+    dataset_path = '/media/dragon_llm/linux_ssd/vla_dataset_unified_static_v13/val'
     
     with open(f'{dataset_path}/episode_meta.json', 'r') as f:
         meta = json.load(f)
     
-    z = zarr.open_group(dataset_path)
-    sample_ids = [m['sample_id'] for m in meta]
-    unique_sample_ids = sorted(set(sample_ids))
-    sample_id_to_idx = {sid: i for i, sid in enumerate(unique_sample_ids)}
+    dataset_root = Path(dataset_path)
+    zarr_root = dataset_root / 'dataset.zarr' if (dataset_root / 'dataset.zarr').exists() else dataset_root
+    z = zarr.open_group(str(zarr_root), mode='r')
+
+    # Prefer explicit mapping if present (unified format)
+    sample_indices_path = dataset_root / 'sample_indices.json'
+    if not sample_indices_path.exists():
+        sample_indices_path = zarr_root.parent / 'sample_indices.json'
+    if sample_indices_path.exists():
+        with open(sample_indices_path, 'r') as f:
+            sample_id_to_idx = json.load(f)
+    else:
+        sample_ids = [m['sample_id'] for m in meta]
+        unique_sample_ids = sorted(set(sample_ids))
+        sample_id_to_idx = {sid: i for i, sid in enumerate(unique_sample_ids)}
     
     # Get first episode
     ep = meta[0]
@@ -447,7 +681,7 @@ if __name__ == "__main__":
     result = planner.generate_trajectory(
         image=image,
         instruction=ep['instruction'],
-        start=start
+        start=start,
     )
     
     print(f'\nResult:')

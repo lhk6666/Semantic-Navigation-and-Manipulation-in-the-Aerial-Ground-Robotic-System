@@ -1,5 +1,6 @@
 # Gemini configuration file
-project_id: 584672874437
+project_id: prime-mechanic-454301-v4
+location: us-west1 # Can be updated to other locations according to the localization of the project
 finetuned_location: us-west1 # Can be updated to other locations according to the localization of the customization
 flash_model: gemini-2.5-flash # Can be updated to other flash models according to the latest release
 pro_model: gemini-3-pro-preview # Can be updated to other pro models according to the latest release

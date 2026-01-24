@@ -129,6 +129,7 @@ class SemanticMapPlanner:
         
         vertexai.init(
             project=cfg["project_id"],
+            location=cfg["location"]
         )
         
         # Use flash model for semantic maps (more general)
@@ -138,9 +139,9 @@ class SemanticMapPlanner:
         )
         
         self.generation_config = {
-            "max_output_tokens": 4096,
+            "max_output_tokens": 8192,
             "temperature": 0.0,
-            "top_p": 0.0,
+            "top_p": 1.0,
         }
         
         self.safety_settings = [
@@ -163,7 +164,7 @@ class SemanticMapPlanner:
         ]
     
     def _get_system_prompt(self) -> str:
-        return """You are analyzing a TOP-DOWN VIEW (bird's eye view) semantic map of an indoor environment for robot navigation.
+                return """You are analyzing a TOP-DOWN VIEW (bird's eye view) semantic map of an indoor environment for robot navigation.
 
 The image is a 2D floor plan view from above, showing:
 - Different colored regions representing different areas/objects (tables, chairs, sofas, beds, etc.)
@@ -177,32 +178,30 @@ Your task is to identify objects and their locations in NORMALIZED COORDINATES w
 - y increases from TOP to BOTTOM
 
 Given a navigation instruction, identify:
-1. The navigation GOAL location (what the robot should move to) in normalized coordinates.
-2. Any OBSTACLES that might block a direct path.
-3. A suggested START position if visible (usually the robot's current location).
-
-Directional/side instructions (IMPORTANT):
-- If the instruction says to go to a SIDE of an object (e.g., "left of the table", "right side of the sofa", "upper of the bed"), then:
-    - Set "target" to the GOAL point on that requested side (slightly outside the object's region).
-    - The referenced object itself MUST be treated as an obstacle (otherwise a planner may route through it).
-    - Include the object's approximate center as "target_object" (optional field) AND also include it in "obstacles".
+1. The TARGET OBJECT (the object the instruction refers to) with its center and bounding box.
+2. Other obstacle objects that might block a path, with their centers and bounding boxes.
+3. A suggested START position if visible.
+4. If multiple candidates exist, choose the one you judge most consistent with the instruction and overall scene layout.
 
 Output ONLY valid JSON. Required keys are exactly:
 {
-    "target": {"name": "object_name", "x": 0.5, "y": 0.7, "confidence": "high/medium/low"},
-    "obstacles": [{"name": "obstacle1", "x": 0.3, "y": 0.4}],
-    "start": {"x": 0.2, "y": 0.3}
+    "target": {
+        "name": "object_name",
+        "center": [0.50, 0.70],
+        "bbox": [0.40, 0.60, 0.60, 0.85],
+        "confidence": "high/medium/low"
+    },
+    "obstacles": [
+        {"name": "obstacle1", "center": [0.30, 0.40], "bbox": [0.25, 0.32, 0.38, 0.48]}
+    ],
+    "start": {"x": 0.20, "y": 0.30}
 }
 
-If and only if the instruction is directional (go to a side of an object), you may add this optional key:
-        "target_object": {"name": "object_name", "x": 0.5, "y": 0.7}
-
 Important:
-- Coordinates must be between 0.0 and 1.0
-- If you cannot identify an object with confidence, set confidence to "low"
-- Look for semantic regions that match the target description (e.g., "table" might be a rectangular region)
-- Consider the relative positions mentioned in instructions (e.g., "lower table" means the table at higher y value)
-- "left/right" refers to x-axis, "upper/lower/top/bottom" refers to y-axis"""
+- All coordinates must be between 0.0 and 1.0
+- bbox format is [xmin, ymin, xmax, ymax] in normalized coords
+- Ensure xmin < xmax and ymin < ymax
+- If uncertain, still provide your best guess and set confidence to "low""" 
 
     def draw_grid(self, image: np.ndarray, grid_size: int = 5) -> np.ndarray:
         """Draw a coordinate grid overlay on the image"""
@@ -264,7 +263,7 @@ Important:
         self,
         image: np.ndarray,
         instruction: str,
-        add_grid: bool = True,
+        add_grid: bool = False,
         require_target: bool = True,
     ) -> dict:
         """
@@ -301,10 +300,11 @@ Output your analysis as JSON only."""
                 data=base64.b64decode(img_base64),
                 mime_type="image/jpeg"
             ),
-            Part.from_text(base_text)
+            Part.from_text(text=base_text)
         ]
 
-        max_retries = 5 if require_target else 3
+        # Keep this planner lightweight: minimal retries.
+        max_retries = 2 if require_target else 1
         last_result = None
         for attempt in range(max_retries):
             try:
@@ -326,32 +326,25 @@ Output your analysis as JSON only."""
             except Exception as e:
                 print(f"Attempt {attempt + 1} failed: {e}")
                 if attempt < max_retries - 1:
-                    # Escalate instructions on subsequent retries.
+                    # Simple retry note.
                     contents = [
                         contents[0],
                         Part.from_text(
-                            base_text
-                            + "\n\nRetry note: Your previous output was invalid or missing 'target'. "
-                              "Return ONLY JSON and ensure target.x/target.y are present (numbers 0..1)."
+                            text=(
+                                base_text
+                                + "\n\nRetry: Return ONLY JSON and include target.x and target.y as numbers in [0,1]."
+                            )
                         ),
                     ]
-                    time.sleep(1)
                 else:
-                    # Final fallback: always return a target so downstream code can proceed.
                     fallback = last_result if isinstance(last_result, dict) else {
                         "target": None,
-                        "target_object": None,
+                        "goal": None,
+                        "approach_side": None,
                         "obstacles": [],
                         "start": None,
                         "raw_response": "",
                     }
-                    if require_target and not fallback.get("target"):
-                        fallback["target"] = {
-                            "name": "unknown",
-                            "x": 0.5,
-                            "y": 0.5,
-                            "confidence": "low",
-                        }
                     fallback["error"] = str(e)
                     return fallback
     
@@ -359,11 +352,61 @@ Output your analysis as JSON only."""
         """Parse VLM response to extract structured data"""
         result = {
             "target": None,
-            "target_object": None,
+            "goal": None,
+            "approach_side": None,
             "obstacles": [],
             "start": None,
             "raw_response": response_text
         }
+
+        def _clip01(v: float) -> float:
+            return float(np.clip(float(v), 0.0, 1.0))
+
+        def _parse_center(obj: dict) -> Optional[Tuple[float, float]]:
+            if not isinstance(obj, dict):
+                return None
+            c = obj.get("center")
+            if isinstance(c, (list, tuple)) and len(c) == 2:
+                return (_clip01(c[0]), _clip01(c[1]))
+            if obj.get("x") is not None and obj.get("y") is not None:
+                return (_clip01(obj["x"]), _clip01(obj["y"]))
+            return None
+
+        def _parse_bbox(obj: dict) -> Optional[Tuple[float, float, float, float]]:
+            if not isinstance(obj, dict):
+                return None
+            b = obj.get("bbox")
+            if not (isinstance(b, (list, tuple)) and len(b) == 4):
+                return None
+            xmin, ymin, xmax, ymax = (_clip01(b[0]), _clip01(b[1]), _clip01(b[2]), _clip01(b[3]))
+            if xmax <= xmin or ymax <= ymin:
+                return None
+            return (xmin, ymin, xmax, ymax)
+
+        def _side_from_dir(dx: float, dy: float) -> str:
+            if dx < 0:
+                return "left"
+            if dx > 0:
+                return "right"
+            if dy < 0:
+                return "top"
+            if dy > 0:
+                return "bottom"
+            return "none"
+
+        def _goal_from_bbox_and_side(bbox: Tuple[float, float, float, float], side: str, center: Tuple[float, float]) -> Tuple[float, float]:
+            xmin, ymin, xmax, ymax = bbox
+            cx, cy = center
+            offset = 0.02
+            if side == "left":
+                return (_clip01(xmin - offset), cy)
+            if side == "right":
+                return (_clip01(xmax + offset), cy)
+            if side == "top":
+                return (cx, _clip01(ymin - offset))
+            if side == "bottom":
+                return (cx, _clip01(ymax + offset))
+            return (cx, cy)
         
         try:
             text = self._extract_json_text(response_text)
@@ -373,88 +416,58 @@ Output your analysis as JSON only."""
                 repaired = self._repair_json_text(text)
                 data = json.loads(repaired)
             
-            # Extract target
+            # Extract target object
             if "target" in data and data["target"]:
-                target = data["target"]
-                if target.get("x") is not None and target.get("y") is not None:
+                tgt = data["target"]
+                center = _parse_center(tgt)
+                bbox = _parse_bbox(tgt)
+                if center is not None and bbox is not None:
                     result["target"] = {
-                        "name": target.get("name", "unknown"),
-                        "x": float(np.clip(float(target["x"]), 0.0, 1.0)),
-                        "y": float(np.clip(float(target["y"]), 0.0, 1.0)),
-                        "confidence": target.get("confidence", "medium")
-                    }
-
-            # Optional: extract explicit target object center (for directional tasks)
-            if "target_object" in data and data["target_object"]:
-                tobj = data["target_object"]
-                if tobj.get("x") is not None and tobj.get("y") is not None:
-                    result["target_object"] = {
-                        "name": tobj.get("name", (result["target"]["name"] if result["target"] else "unknown")),
-                        "x": float(np.clip(float(tobj["x"]), 0.0, 1.0)),
-                        "y": float(np.clip(float(tobj["y"]), 0.0, 1.0)),
+                        "name": str(tgt.get("name", "unknown")),
+                        "center": [float(center[0]), float(center[1])],
+                        "bbox": [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
+                        "confidence": str(tgt.get("confidence", "medium")),
                     }
             
-            # Extract obstacles
+            # Extract obstacles (as objects with bboxes)
             if "obstacles" in data and data["obstacles"]:
                 for obs in data["obstacles"]:
-                    if obs.get("x") is not None and obs.get("y") is not None:
-                        result["obstacles"].append({
-                            "name": obs.get("name", "obstacle"),
-                            "x": float(np.clip(float(obs["x"]), 0.0, 1.0)),
-                            "y": float(np.clip(float(obs["y"]), 0.0, 1.0))
-                        })
+                    center = _parse_center(obs)
+                    bbox = _parse_bbox(obs)
+                    if center is None or bbox is None:
+                        continue
+                    result["obstacles"].append({
+                        "name": str(obs.get("name", "obstacle")),
+                        "center": [float(center[0]), float(center[1])],
+                        "bbox": [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
+                    })
             
             # Extract start
             if "start" in data and data["start"]:
                 start = data["start"]
                 if start.get("x") is not None and start.get("y") is not None:
                     result["start"] = {
-                        "x": float(np.clip(float(start["x"]), 0.0, 1.0)),
-                        "y": float(np.clip(float(start["y"]), 0.0, 1.0))
+                        "x": _clip01(start["x"]),
+                        "y": _clip01(start["y"])
                     }
 
-            # Post-process directional tasks: ensure the target object is treated as an obstacle.
+            # Derive approach side from instruction and compute the navigation goal.
             side_dir = self._infer_side_direction(instruction)
-            if side_dir is not None and result.get("target") is not None:
-                dx, dy = side_dir
-
-                # If the model already included the target object as an obstacle with the same name, reuse it.
-                tgt_name = str(result["target"].get("name", "unknown"))
-                same_name_obs = None
-                for obs in result.get("obstacles", []):
-                    if str(obs.get("name", "")) == tgt_name:
-                        same_name_obs = obs
-                        break
-
-                if result.get("target_object") is None and same_name_obs is not None:
-                    result["target_object"] = {
-                        "name": tgt_name,
-                        "x": float(same_name_obs["x"]),
-                        "y": float(same_name_obs["y"]),
-                    }
-
-                # If we still don't have an explicit object center, assume the current target is the object center
-                # and shift the navigation goal to the requested side.
-                if result.get("target_object") is None:
-                    obj_cx = float(result["target"]["x"])
-                    obj_cy = float(result["target"]["y"])
-                    result["target_object"] = {"name": tgt_name, "x": obj_cx, "y": obj_cy}
-
-                    offset = 0.06
-                    goal_x = float(np.clip(obj_cx + dx * offset, 0.0, 1.0))
-                    goal_y = float(np.clip(obj_cy + dy * offset, 0.0, 1.0))
-                    result["target"]["x"] = goal_x
-                    result["target"]["y"] = goal_y
-
-                # Ensure the object center is present in obstacles.
-                obj = result["target_object"]
-                already = False
-                for obs in result.get("obstacles", []):
-                    if abs(float(obs.get("x", 0.0)) - float(obj["x"])) < 0.02 and abs(float(obs.get("y", 0.0)) - float(obj["y"])) < 0.02:
-                        already = True
-                        break
-                if not already:
-                    result["obstacles"].append({"name": obj.get("name", tgt_name), "x": float(obj["x"]), "y": float(obj["y"])})
+            if result.get("target") is not None:
+                bbox = tuple(result["target"]["bbox"])  # type: ignore[assignment]
+                center = tuple(result["target"]["center"])  # type: ignore[assignment]
+                if side_dir is None:
+                    result["approach_side"] = "none"
+                    gx, gy = center
+                else:
+                    dx, dy = side_dir
+                    result["approach_side"] = _side_from_dir(dx, dy)
+                    gx, gy = _goal_from_bbox_and_side(bbox=bbox, side=result["approach_side"], center=center)
+                result["goal"] = {"x": float(gx), "y": float(gy)}
+            
+            # Strict mode: if no target parsed, report an error.
+            if result.get("target") is None:
+                result["error"] = "Missing/invalid 'target' (need center + bbox)"
                     
         except json.JSONDecodeError as e:
             result["error"] = f"JSON parse error: {e}"
@@ -468,22 +481,33 @@ if __name__ == "__main__":
     import zarr
     
     # Test with dataset
-    dataset_path = '/media/dragon_llm/linux_ssd/vla_dp_224/val'
+    dataset_path = '/media/dragon_llm/linux_ssd/vla_dataset_unified_static_v13/val'
     
     with open(f'{dataset_path}/episode_meta.json', 'r') as f:
         meta = json.load(f)
     
-    z = zarr.open_group(dataset_path)
-    sample_ids = [m['sample_id'] for m in meta]
-    unique_sample_ids = sorted(set(sample_ids))
-    sample_id_to_idx = {sid: i for i, sid in enumerate(unique_sample_ids)}
+    dataset_root = Path(dataset_path)
+    zarr_root = dataset_root / 'dataset.zarr' if (dataset_root / 'dataset.zarr').exists() else dataset_root
+    z = zarr.open_group(str(zarr_root), mode='r')
+
+    # Prefer explicit mapping if present (unified format)
+    sample_indices_path = dataset_root / 'sample_indices.json'
+    if not sample_indices_path.exists():
+        sample_indices_path = zarr_root.parent / 'sample_indices.json'
+    if sample_indices_path.exists():
+        with open(sample_indices_path, 'r') as f:
+            sample_id_to_idx = json.load(f)
+    else:
+        sample_ids = [m['sample_id'] for m in meta]
+        unique_sample_ids = sorted(set(sample_ids))
+        sample_id_to_idx = {sid: i for i, sid in enumerate(unique_sample_ids)}
     
     # Get first episode
     ep = meta[0]
     print(f'Episode 0:')
     print(f'  Instruction: {ep["instruction"]}')
-    print(f'  GT Goal (normalized): {ep["goal"]}')
-    print(f'  GT Start (normalized): {ep["start"]}')
+    print(f'  GT Goal: {ep["goal"]}')
+    print(f'  GT Start: {ep["start"]}')
     
     # Get image
     img_idx = sample_id_to_idx[ep['sample_id']]
@@ -502,7 +526,7 @@ if __name__ == "__main__":
     print(f'  Start: {result["start"]}')
     
     if result["target"]:
-        pred_goal = [result["target"]["x"], result["target"]["y"]]
+        pred_goal = result["target"]["center"]
         gt_goal = ep["goal"]
         error = np.linalg.norm(np.array(pred_goal) - np.array(gt_goal))
         print(f'\n  Predicted goal: {pred_goal}')

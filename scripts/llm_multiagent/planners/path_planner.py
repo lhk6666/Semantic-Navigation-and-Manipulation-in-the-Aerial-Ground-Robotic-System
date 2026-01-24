@@ -3,6 +3,8 @@ from scipy.interpolate import splprep, splev, BSpline
 from scipy.optimize import minimize
 import matplotlib.pyplot as plt
 import time
+import heapq
+import math
 
 class PathPlanner:
     def __init__(self, num_ctrl_points=8, obstacle_effect_area=3):
@@ -45,6 +47,160 @@ class PathPlanner:
         x = np.interp(s_q, s, polyline[:, 0])
         y = np.interp(s_q, s, polyline[:, 1])
         return np.stack([x, y], axis=1)
+
+    # ---------- A* grid planner (normalized [0,1]) ----------
+    @staticmethod
+    def _clip01(x: float) -> float:
+        return float(np.clip(float(x), 0.0, 1.0))
+
+    @staticmethod
+    def _bbox_to_ij(bbox, grid_size: int):
+        xmin, ymin, xmax, ymax = bbox
+        xmin = PathPlanner._clip01(xmin)
+        ymin = PathPlanner._clip01(ymin)
+        xmax = PathPlanner._clip01(xmax)
+        ymax = PathPlanner._clip01(ymax)
+        i0 = int(math.floor(xmin * (grid_size - 1)))
+        j0 = int(math.floor(ymin * (grid_size - 1)))
+        i1 = int(math.ceil(xmax * (grid_size - 1)))
+        j1 = int(math.ceil(ymax * (grid_size - 1)))
+        i0 = max(0, min(grid_size - 1, i0))
+        j0 = max(0, min(grid_size - 1, j0))
+        i1 = max(0, min(grid_size - 1, i1))
+        j1 = max(0, min(grid_size - 1, j1))
+        if i1 < i0:
+            i0, i1 = i1, i0
+        if j1 < j0:
+            j0, j1 = j1, j0
+        return i0, j0, i1, j1
+
+    @staticmethod
+    def _xy_to_ij(xy, grid_size: int):
+        x, y = float(xy[0]), float(xy[1])
+        x = PathPlanner._clip01(x)
+        y = PathPlanner._clip01(y)
+        i = int(round(x * (grid_size - 1)))
+        j = int(round(y * (grid_size - 1)))
+        i = max(0, min(grid_size - 1, i))
+        j = max(0, min(grid_size - 1, j))
+        return i, j
+
+    @staticmethod
+    def _ij_to_xy(ij, grid_size: int):
+        i, j = int(ij[0]), int(ij[1])
+        x = i / float(grid_size - 1)
+        y = j / float(grid_size - 1)
+        return float(x), float(y)
+
+    def generate_safe_path_astar(
+        self,
+        start_xy,
+        goal_xy,
+        obstacle_bboxes,
+        forbidden_bboxes=None,
+        grid_size: int = 128,
+        allow_diagonal: bool = True,
+        num_points: int = 50,
+    ):
+        """A* path planning on a 2D occupancy grid in normalized [0,1] coordinates.
+
+        Args:
+            start_xy: (x,y) start in [0,1]
+            goal_xy: (x,y) goal in [0,1]
+            obstacle_bboxes: list of [xmin,ymin,xmax,ymax] occupied regions
+            forbidden_bboxes: additional occupied regions (e.g., target bbox to avoid entering)
+            grid_size: number of grid cells along each axis
+            allow_diagonal: 8-neighbor if True else 4-neighbor
+            num_points: output polyline resampled to this many points
+
+        Returns:
+            List[(x,y)] of length ~= num_points in normalized coords.
+
+        Raises:
+            ValueError if no path found.
+        """
+        if grid_size < 8:
+            raise ValueError("grid_size too small")
+        occ = np.zeros((grid_size, grid_size), dtype=bool)
+
+        bboxes = []
+        if obstacle_bboxes:
+            bboxes.extend(obstacle_bboxes)
+        if forbidden_bboxes:
+            bboxes.extend(forbidden_bboxes)
+
+        for b in bboxes:
+            if b is None:
+                continue
+            if not (isinstance(b, (list, tuple)) and len(b) == 4):
+                continue
+            i0, j0, i1, j1 = self._bbox_to_ij(b, grid_size=grid_size)
+            occ[j0 : j1 + 1, i0 : i1 + 1] = True
+
+        start = self._xy_to_ij(start_xy, grid_size=grid_size)
+        goal = self._xy_to_ij(goal_xy, grid_size=grid_size)
+
+        # Ensure start/goal are not occupied; if they are, fail loudly.
+        if occ[start[1], start[0]]:
+            raise ValueError("Start lies in an occupied region")
+        if occ[goal[1], goal[0]]:
+            raise ValueError("Goal lies in an occupied/forbidden region")
+
+        if allow_diagonal:
+            nbrs = [
+                (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+                (-1, -1, math.sqrt(2.0)), (1, -1, math.sqrt(2.0)),
+                (-1, 1, math.sqrt(2.0)), (1, 1, math.sqrt(2.0)),
+            ]
+        else:
+            nbrs = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0)]
+
+        def h(a, b):
+            dx = a[0] - b[0]
+            dy = a[1] - b[1]
+            return math.hypot(dx, dy)
+
+        open_heap = []
+        heapq.heappush(open_heap, (h(start, goal), 0.0, start))
+        came_from = {start: None}
+        g_score = {start: 0.0}
+
+        while open_heap:
+            _, g, cur = heapq.heappop(open_heap)
+            if cur == goal:
+                break
+            if g > g_score.get(cur, float("inf")) + 1e-9:
+                continue
+
+            for di, dj, w in nbrs:
+                ni = cur[0] + di
+                nj = cur[1] + dj
+                if ni < 0 or ni >= grid_size or nj < 0 or nj >= grid_size:
+                    continue
+                if occ[nj, ni]:
+                    continue
+                nxt = (ni, nj)
+                ng = g + w
+                if ng < g_score.get(nxt, float("inf")):
+                    g_score[nxt] = ng
+                    came_from[nxt] = cur
+                    f = ng + h(nxt, goal)
+                    heapq.heappush(open_heap, (f, ng, nxt))
+
+        if goal not in came_from:
+            raise ValueError("A* failed to find a path")
+
+        # Reconstruct path
+        path_ij = []
+        cur = goal
+        while cur is not None:
+            path_ij.append(cur)
+            cur = came_from[cur]
+        path_ij.reverse()
+
+        poly = np.array([self._ij_to_xy(p, grid_size=grid_size) for p in path_ij], dtype=float)
+        poly = self._arc_length_resample(poly, n_samples=int(num_points))
+        return [tuple(p) for p in poly]
 
     # ---------- original: spline via splprep (interpolating nodes) ----------
     def get_spline_path(self, ctrl_points_flat):
