@@ -164,7 +164,7 @@ class SemanticMapPlanner:
         ]
     
     def _get_system_prompt(self) -> str:
-                return """You are analyzing a TOP-DOWN VIEW (bird's eye view) semantic map of an indoor environment for robot navigation.
+                return """You are analyzing a TOP-DOWN VIEW (bird's eye view) RGB image of an indoor environment for robot navigation.
 
 The image is a 2D floor plan view from above, showing:
 - Different colored regions representing different areas/objects (tables, chairs, sofas, beds, etc.)
@@ -279,7 +279,7 @@ Important:
         """
         img_base64 = self.prepare_image(image, add_grid)
         
-        base_text = f"""This is a top-down semantic map of an indoor environment.
+        base_text = f"""This is a top-down RGB image of an indoor environment.
 
 Navigation instruction: "{instruction}"
 

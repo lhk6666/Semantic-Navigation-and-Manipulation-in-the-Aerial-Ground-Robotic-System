@@ -123,6 +123,46 @@ class PathPlanner:
             raise ValueError("grid_size too small")
         occ = np.zeros((grid_size, grid_size), dtype=bool)
 
+        def _nearest_free(start_ij: tuple[int, int]) -> tuple[int, int]:
+            """Find nearest free cell to start_ij via BFS on the grid.
+
+            Returns the first free cell found in increasing graph distance.
+            Raises ValueError if no free cell exists.
+            """
+            si, sj = int(start_ij[0]), int(start_ij[1])
+            si = max(0, min(grid_size - 1, si))
+            sj = max(0, min(grid_size - 1, sj))
+            if not occ[sj, si]:
+                return (si, sj)
+
+            from collections import deque
+
+            q = deque()
+            q.append((si, sj))
+            visited = np.zeros((grid_size, grid_size), dtype=bool)
+            visited[sj, si] = True
+
+            # 8-neighborhood search makes snapping less biased.
+            deltas = [
+                (-1, 0), (1, 0), (0, -1), (0, 1),
+                (-1, -1), (1, -1), (-1, 1), (1, 1),
+            ]
+            while q:
+                ci, cj = q.popleft()
+                for di, dj in deltas:
+                    ni = ci + di
+                    nj = cj + dj
+                    if ni < 0 or ni >= grid_size or nj < 0 or nj >= grid_size:
+                        continue
+                    if visited[nj, ni]:
+                        continue
+                    if not occ[nj, ni]:
+                        return (ni, nj)
+                    visited[nj, ni] = True
+                    q.append((ni, nj))
+
+            raise ValueError("No free cell found in occupancy grid")
+
         bboxes = []
         if obstacle_bboxes:
             bboxes.extend(obstacle_bboxes)
@@ -140,11 +180,17 @@ class PathPlanner:
         start = self._xy_to_ij(start_xy, grid_size=grid_size)
         goal = self._xy_to_ij(goal_xy, grid_size=grid_size)
 
-        # Ensure start/goal are not occupied; if they are, fail loudly.
+        # If start/goal fall inside occupied/forbidden cells, snap to the nearest free cell.
         if occ[start[1], start[0]]:
-            raise ValueError("Start lies in an occupied region")
+            snapped = _nearest_free(start)
+            if snapped != start:
+                print("[PathPlanner][A*] Start lies in an occupied region; snapping to nearest free cell")
+            start = snapped
         if occ[goal[1], goal[0]]:
-            raise ValueError("Goal lies in an occupied/forbidden region")
+            snapped = _nearest_free(goal)
+            if snapped != goal:
+                print("[PathPlanner][A*] Goal lies in an occupied/forbidden region; snapping to nearest free cell")
+            goal = snapped
 
         if allow_diagonal:
             nbrs = [
