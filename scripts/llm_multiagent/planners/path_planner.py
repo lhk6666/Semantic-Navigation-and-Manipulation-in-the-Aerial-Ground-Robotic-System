@@ -101,6 +101,8 @@ class PathPlanner:
         grid_size: int = 128,
         allow_diagonal: bool = True,
         num_points: int = 50,
+        inflation_px: int = 50,                 
+        bbox_image_wh: tuple[int, int] = (640, 480),
     ):
         """A* path planning on a 2D occupancy grid in normalized [0,1] coordinates.
 
@@ -163,6 +165,21 @@ class PathPlanner:
 
             raise ValueError("No free cell found in occupancy grid")
 
+        if bbox_image_wh is None:
+            ref_w = ref_h = grid_size
+        else:
+            ref_w, ref_h = int(bbox_image_wh[0]), int(bbox_image_wh[1])
+            ref_w = max(1, ref_w)
+            ref_h = max(1, ref_h)
+
+        infl_px = int(max(0, inflation_px))
+        # normalized inflation along each axis
+        infl_norm_x = infl_px / float(ref_w)
+        infl_norm_y = infl_px / float(ref_h)
+        # convert to grid cells (ceil so we never under-inflate)
+        infl_i = int(math.ceil(infl_norm_x * grid_size))
+        infl_j = int(math.ceil(infl_norm_y * grid_size))
+        
         bboxes = []
         if obstacle_bboxes:
             bboxes.extend(obstacle_bboxes)
@@ -175,6 +192,13 @@ class PathPlanner:
             if not (isinstance(b, (list, tuple)) and len(b) == 4):
                 continue
             i0, j0, i1, j1 = self._bbox_to_ij(b, grid_size=grid_size)
+
+            # inflate in grid cells (anisotropic if ref_w != ref_h)
+            i0 = max(0, i0 - infl_i)
+            i1 = min(grid_size - 1, i1 + infl_i)
+            j0 = max(0, j0 - infl_j)
+            j1 = min(grid_size - 1, j1 + infl_j)
+
             occ[j0 : j1 + 1, i0 : i1 + 1] = True
 
         start = self._xy_to_ij(start_xy, grid_size=grid_size)
