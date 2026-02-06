@@ -101,7 +101,7 @@ class PathPlanner:
         grid_size: int = 128,
         allow_diagonal: bool = True,
         num_points: int = 50,
-        inflation_px: int = 50,                 
+        inflation_px: int = 10,                 
         bbox_image_wh: tuple[int, int] = (640, 480),
     ):
         """A* path planning on a 2D occupancy grid in normalized [0,1] coordinates.
