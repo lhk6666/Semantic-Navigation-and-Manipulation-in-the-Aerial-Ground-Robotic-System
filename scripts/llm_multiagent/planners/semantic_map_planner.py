@@ -14,11 +14,17 @@ import json
 import time
 import yaml
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable
 import re
 
-import vertexai
-from vertexai.generative_models import GenerativeModel, SafetySetting, Part
+try:
+    import vertexai
+    from vertexai.generative_models import GenerativeModel, SafetySetting, Part
+except Exception:  # pragma: no cover - backend dependency is optional
+    vertexai = None
+    GenerativeModel = None
+    SafetySetting = None
+    Part = None
 
 
 class SemanticMapPlanner:
@@ -118,7 +124,16 @@ class SemanticMapPlanner:
             return (0.0, 1.0)
         return None
     
-    def __init__(self, use_finetuned: bool = False):
+    def __init__(
+        self,
+        use_finetuned: bool = False,
+        *,
+        backend: Optional[str] = None,
+        model: Optional[str] = None,
+        api_key_env: Optional[str] = None,
+        before_request: Optional[Callable[[], None]] = None,
+        http_timeout_ms: int = 120000,
+    ):
         """
         Args:
             use_finetuned: Whether to use finetuned model (requires endpoint)
@@ -127,24 +142,74 @@ class SemanticMapPlanner:
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
         
-        vertexai.init(
-            project=cfg["project_id"],
-            location=cfg["location"]
-        )
-        
-        # Use flash model for semantic maps (more general)
-        self.model = GenerativeModel(
-            cfg["flash_model"],
-            system_instruction=self._get_system_prompt()
-        )
-        
+        self.cfg = cfg or {}
+        self.before_request = before_request
+        self.http_timeout_ms = int(http_timeout_ms)
+        if self.http_timeout_ms <= 0:
+            raise ValueError("http_timeout_ms must be positive")
+        self.llm_backend = str(backend or self.cfg.get("llm_backend") or "vertexai").lower()
+        if self.llm_backend not in {"vertexai", "genai"}:
+            raise RuntimeError(f"Unsupported llm_backend={self.llm_backend!r}")
+        self.genai_client = None
+        self.api_key_env_name = None
+
+        if self.llm_backend == "genai":
+            self.api_key_env_name = str(
+                api_key_env or self.cfg.get("genai_api_key_env") or "GEMINI_API_KEY"
+            )
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.api_key_env_name):
+                raise RuntimeError(
+                    "Invalid API-key environment variable name; do not provide a key value"
+                )
+            api_key = os.environ.get(self.api_key_env_name)
+            if not api_key:
+                raise RuntimeError(
+                    "Missing Google AI Studio API key in environment variable "
+                    f"{self.api_key_env_name}"
+                )
+            try:
+                from google import genai  # type: ignore
+                from google.genai import types  # type: ignore
+            except Exception as error:
+                raise RuntimeError(
+                    "google-genai is not installed; install it or select vertexai"
+                ) from error
+            self.model_name = str(
+                model or self.cfg.get("genai_model") or "gemini-2.5-flash"
+            )
+            http_options = types.HttpOptions(
+                timeout=self.http_timeout_ms,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            )
+            self.genai_client = genai.Client(
+                api_key=api_key,
+                http_options=http_options,
+            )
+            self.model = None
+        else:
+            if vertexai is None or GenerativeModel is None:
+                raise RuntimeError(
+                    "vertexai SDK is not available; install it or select genai"
+                )
+            vertexai.init(
+                project=self.cfg["project_id"],
+                location=self.cfg["location"]
+            )
+            self.model_name = str(
+                model or self.cfg.get("flash_model") or "gemini-2.5-flash"
+            )
+            self.model = GenerativeModel(
+                self.model_name,
+                system_instruction=self._get_system_prompt()
+            )
+
         self.generation_config = {
             "max_output_tokens": 8192,
             "temperature": 0.0,
             "top_p": 1.0,
         }
         
-        self.safety_settings = [
+        self.safety_settings = [] if self.llm_backend == "genai" else [
             SafetySetting(
                 category=SafetySetting.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
                 threshold=SafetySetting.HarmBlockThreshold.OFF
@@ -162,6 +227,63 @@ class SemanticMapPlanner:
                 threshold=SafetySetting.HarmBlockThreshold.OFF
             ),
         ]
+
+    def _safe_error(self, error: Exception) -> str:
+        """Format an SDK error without ever exposing the configured API key."""
+        message = str(error)
+        if self.api_key_env_name:
+            secret = os.environ.get(self.api_key_env_name)
+            if secret:
+                message = message.replace(secret, "[REDACTED]")
+        return message
+
+    def _call_llm(self, image_bytes: bytes, prompt_text: str) -> str:
+        """Call the selected backend with identical prompt/model parameters."""
+        if self.before_request is not None:
+            self.before_request()
+        if self.llm_backend == "genai":
+            from google.genai import types  # type: ignore
+
+            if hasattr(types.Part, "from_bytes"):
+                image_part = types.Part.from_bytes(
+                    data=image_bytes, mime_type="image/jpeg"
+                )
+            else:  # pragma: no cover - old SDK compatibility
+                image_part = types.Part(
+                    inline_data=types.Blob(mime_type="image/jpeg", data=image_bytes)
+                )
+            if hasattr(types.Part, "from_text"):
+                text_part = types.Part.from_text(text=prompt_text)
+            else:  # pragma: no cover
+                text_part = types.Part(text=prompt_text)
+            config_kwargs = {
+                "max_output_tokens": 8192,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "response_mime_type": "application/json",
+                "system_instruction": self._get_system_prompt(),
+            }
+            try:
+                generate_config = types.GenerateContentConfig(**config_kwargs)
+            except TypeError:  # pragma: no cover - old SDK compatibility
+                config_kwargs.pop("response_mime_type", None)
+                generate_config = types.GenerateContentConfig(**config_kwargs)
+            response = self.genai_client.models.generate_content(
+                model=self.model_name,
+                contents=[types.Content(role="user", parts=[image_part, text_part])],
+                config=generate_config,
+            )
+            return getattr(response, "text", None) or str(response)
+
+        response = self.model.generate_content(
+            contents=[
+                Part.from_data(data=image_bytes, mime_type="image/jpeg"),
+                Part.from_text(text=prompt_text),
+            ],
+            generation_config=self.generation_config,
+            safety_settings=self.safety_settings,
+        )
+        return response.text
     
     def _get_system_prompt(self) -> str:
                 return """You are analyzing a TOP-DOWN VIEW (bird's eye view) RGB image of an indoor environment for robot navigation.
@@ -290,32 +412,22 @@ Please analyze the image and identify:
 
 Important: If the instruction asks for a SIDE of an object (left/right/upper/lower side), then the object itself must be treated as an obstacle.
 
-CRITICAL: You MUST output a non-null "target" with numeric "x" and "y" in [0, 1].
+CRITICAL: You MUST output a non-null "target" with numeric center [x,y] and
+bbox [xmin,ymin,xmax,ymax] values in [0,1]. Each obstacle must also include a bbox.
 If uncertain, still provide your best guess and set confidence to "low".
 
 Output your analysis as JSON only."""
 
-        contents = [
-            Part.from_data(
-                data=base64.b64decode(img_base64),
-                mime_type="image/jpeg"
-            ),
-            Part.from_text(text=base_text)
-        ]
+        image_bytes = base64.b64decode(img_base64)
+        prompt_text = base_text
 
         # Keep this planner lightweight: minimal retries.
         max_retries = 2 if require_target else 1
         last_result = None
         for attempt in range(max_retries):
             try:
-                response = self.model.generate_content(
-                    contents=contents,
-                    generation_config=self.generation_config,
-                    safety_settings=self.safety_settings
-                )
-                
-                # Parse response
-                result = self._parse_response(response.text, instruction=instruction)
+                response_text = self._call_llm(image_bytes, prompt_text)
+                result = self._parse_response(response_text, instruction=instruction)
                 last_result = result
 
                 if require_target and (not result.get("target") or result.get("error")):
@@ -324,18 +436,16 @@ Output your analysis as JSON only."""
                 return result
                 
             except Exception as e:
-                print(f"Attempt {attempt + 1} failed: {e}")
+                safe_error = self._safe_error(e)
+                print(f"Attempt {attempt + 1} failed: {safe_error}")
                 if attempt < max_retries - 1:
                     # Simple retry note.
-                    contents = [
-                        contents[0],
-                        Part.from_text(
-                            text=(
-                                base_text
-                                + "\n\nRetry: Return ONLY JSON and include target.x and target.y as numbers in [0,1]."
-                            )
-                        ),
-                    ]
+                    prompt_text = (
+                        base_text
+                        + "\n\nRetry: Return ONLY JSON. Include target.center as [x,y], "
+                        "target.bbox as [xmin,ymin,xmax,ymax], and each obstacle.bbox "
+                        "in the same format, all numeric and in [0,1]."
+                    )
                 else:
                     fallback = last_result if isinstance(last_result, dict) else {
                         "target": None,
@@ -345,7 +455,7 @@ Output your analysis as JSON only."""
                         "start": None,
                         "raw_response": "",
                     }
-                    fallback["error"] = str(e)
+                    fallback["error"] = safe_error
                     return fallback
     
     def _parse_response(self, response_text: str, instruction: str = "") -> dict:

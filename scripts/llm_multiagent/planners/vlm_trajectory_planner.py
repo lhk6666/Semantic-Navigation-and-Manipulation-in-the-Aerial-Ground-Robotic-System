@@ -23,7 +23,7 @@ import time
 import yaml
 import re
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Callable
 
 try:
     import vertexai
@@ -33,6 +33,9 @@ except Exception:  # pragma: no cover
     GenerativeModel = None
     SafetySetting = None
     Part = None
+
+
+_UNSET = object()
 
 
 class VLMTrajectoryPlanner:
@@ -46,7 +49,20 @@ class VLMTrajectoryPlanner:
     NO goal position is provided - VLM must understand the instruction.
     """
     
-    def __init__(self, num_waypoints: int = 16):
+    def __init__(
+        self,
+        num_waypoints: int = 16,
+        *,
+        backend: Optional[str] = None,
+        model: Optional[str] = None,
+        api_key_env: Optional[str] = None,
+        allow_fallback: Optional[bool] = None,
+        before_request: Optional[Callable[[], None]] = None,
+        max_output_tokens: Optional[int] = None,
+        genai_use_google_search: Optional[bool] = None,
+        genai_thinking_level: Any = _UNSET,
+        http_timeout_ms: int = 120000,
+    ):
         """
         Args:
             num_waypoints: Number of waypoints to generate (default 16 to match VLA)
@@ -56,19 +72,49 @@ class VLMTrajectoryPlanner:
             cfg = yaml.safe_load(f)
 
         self.cfg = cfg or {}
-        self.llm_backend = (self.cfg.get("llm_backend") or "vertexai").lower()
+        self.llm_backend = str(backend or self.cfg.get("llm_backend") or "vertexai").lower()
+        if self.llm_backend not in {"vertexai", "genai"}:
+            raise RuntimeError(f"Unsupported llm_backend={self.llm_backend!r}")
         
         self.num_waypoints = num_waypoints
+        self.before_request = before_request
+        self.http_timeout_ms = int(http_timeout_ms)
+        if self.http_timeout_ms <= 0:
+            raise ValueError("http_timeout_ms must be positive")
 
-        self.max_output_tokens = int(self.cfg.get("vlm_traj_max_output_tokens", 8192))
-        self.allow_fallback = bool(self.cfg.get("vlm_traj_allow_fallback", True))
+        self.max_output_tokens = int(
+            self.cfg.get("vlm_traj_max_output_tokens", 8192)
+            if max_output_tokens is None
+            else max_output_tokens
+        )
+        self.allow_fallback = (
+            bool(self.cfg.get("vlm_traj_allow_fallback", True))
+            if allow_fallback is None
+            else bool(allow_fallback)
+        )
+        self.genai_use_google_search = (
+            bool(self.cfg.get("genai_use_google_search", False))
+            if genai_use_google_search is None
+            else bool(genai_use_google_search)
+        )
+        self.genai_thinking_level = (
+            self.cfg.get("genai_thinking_level", None)
+            if genai_thinking_level is _UNSET
+            else genai_thinking_level
+        )
 
         self.genai_client = None
         self.genai_model = None
+        self.api_key_env_name = None
 
         if self.llm_backend == "genai":
             # Google GenAI (API key) backend (no Vertex AI)
-            api_key_env = str(self.cfg.get("genai_api_key_env", "GOOGLE_CLOUD_API_KEY") or "GOOGLE_CLOUD_API_KEY")
+            api_key_env = str(
+                api_key_env
+                or self.cfg.get("genai_api_key_env")
+                or "GEMINI_API_KEY"
+            )
+            self.api_key_env_name = api_key_env
             # Guardrail: don't let users paste the API key itself into YAML.
             # Env var names should look like: [A-Za-z_][A-Za-z0-9_]*
             if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", api_key_env):
@@ -85,6 +131,7 @@ class VLMTrajectoryPlanner:
                 )
             try:
                 from google import genai  # type: ignore
+                from google.genai import types  # type: ignore
             except Exception as e:
                 raise RuntimeError(
                     "google-genai is not installed. Install it (pip install google-genai) "
@@ -92,8 +139,20 @@ class VLMTrajectoryPlanner:
                 ) from e
 
             # Match the sample style (no Vertex AI)
-            self.genai_client = genai.Client(api_key=api_key)
-            self.genai_model = self.cfg.get("genai_model", "gemini-3-pro-preview")
+            http_options = types.HttpOptions(
+                timeout=self.http_timeout_ms,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            )
+            self.genai_client = genai.Client(
+                api_key=api_key,
+                http_options=http_options,
+            )
+            self.genai_model = str(
+                model
+                or self.cfg.get("genai_model")
+                or "gemini-2.5-flash"
+            )
+            self.model_name = self.genai_model
         else:
             # Vertex AI backend
             if vertexai is None or GenerativeModel is None:
@@ -102,15 +161,16 @@ class VLMTrajectoryPlanner:
                 )
 
             vertexai.init(project=self.cfg["project_id"], location=self.cfg["location"])
+            self.model_name = str(model or self.cfg.get("flash_model") or "gemini-2.5-flash")
         
         # Use flash model for trajectory generation
         self.model = None
         if self.llm_backend != "genai":
             self.model = GenerativeModel(
-                self.cfg.get("flash_model"),
+                self.model_name,
                 system_instruction=self._get_system_prompt(),
             )
-        
+
         self.generation_config = {
             "max_output_tokens": self.max_output_tokens,
             "temperature": 0.0,  # Lower temperature for more consistent paths
@@ -118,7 +178,7 @@ class VLMTrajectoryPlanner:
             "response_mime_type": "application/json",  # Force JSON output
         }
         
-        self.safety_settings = [
+        self.safety_settings = [] if self.llm_backend == "genai" else [
             SafetySetting(
                 category=SafetySetting.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
                 threshold=SafetySetting.HarmBlockThreshold.OFF
@@ -136,6 +196,15 @@ class VLMTrajectoryPlanner:
                 threshold=SafetySetting.HarmBlockThreshold.OFF
             ),
         ]
+
+    def _safe_error(self, error: Exception) -> str:
+        """Format an SDK error without ever exposing the configured API key."""
+        message = str(error)
+        if self.api_key_env_name:
+            secret = os.environ.get(self.api_key_env_name)
+            if secret:
+                message = message.replace(secret, "[REDACTED]")
+        return message
 
     def _extract_json_text(self, response_text: str) -> str:
         text = (response_text or "").strip()
@@ -217,6 +286,8 @@ class VLMTrajectoryPlanner:
 
     def _call_llm(self, image_bytes: bytes, prompt_text: str) -> str:
         """Call configured LLM backend and return response text."""
+        if self.before_request is not None:
+            self.before_request()
         if self.llm_backend == "genai":
             from google.genai import types  # type: ignore
 
@@ -237,8 +308,8 @@ class VLMTrajectoryPlanner:
             contents = [types.Content(role="user", parts=parts)]
 
             # Optional knobs to match the sample template
-            use_search = bool(self.cfg.get("genai_use_google_search", False))
-            thinking_level = self.cfg.get("genai_thinking_level", None)
+            use_search = self.genai_use_google_search
+            thinking_level = self.genai_thinking_level
 
             tools = None
             if use_search:
@@ -255,6 +326,8 @@ class VLMTrajectoryPlanner:
                 "temperature": 0.0,
                 "top_p": 1.0,
                 "max_output_tokens": self.max_output_tokens,
+                # google-genai does not inherit Vertex's model-level system prompt.
+                "system_instruction": self._get_system_prompt(),
             }
             if tools is not None:
                 cfg_kwargs["tools"] = tools
@@ -467,7 +540,8 @@ Output JSON with target info and trajectory array."""
                 return result
                 
             except Exception as e:
-                print(f"Attempt {attempt + 1} failed: {e}")
+                safe_error = self._safe_error(e)
+                print(f"Attempt {attempt + 1} failed: {safe_error}")
                 if attempt < max_retries - 1:
                     time.sleep(1)
                 else:
@@ -477,7 +551,7 @@ Output JSON with target info and trajectory array."""
                         "trajectory": [],
                         "reasoning": "",
                         "raw_response": None,
-                        "error": str(e),
+                        "error": safe_error,
                     }
 
         # If we exhausted retries and allow fallback, try to infer target and return straight line.
@@ -491,6 +565,7 @@ Output JSON with target info and trajectory array."""
                     "reasoning": "fallback straight line due to truncated output",
                     "raw_response": last_result.get("raw_response"),
                     "error": last_result.get("error") or "truncated output",
+                    "used_fallback": True,
                 }
 
         return last_result or {
@@ -508,7 +583,8 @@ Output JSON with target info and trajectory array."""
             "trajectory": [],
             "reasoning": "",
             "raw_response": response_text,
-            "error": None
+            "error": None,
+            "used_fallback": False,
         }
         
         try:
@@ -568,6 +644,7 @@ Output JSON with target info and trajectory array."""
                 goal = np.array([result["target"]["x"], result["target"]["y"]])
                 result["trajectory"] = self._make_straight_line(start, goal)
                 result["reasoning"] = (result.get("reasoning") or "") + " fallback"
+                result["used_fallback"] = True
                 
         except json.JSONDecodeError as e:
             result["error"] = f"JSON parse error: {e}"

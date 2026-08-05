@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal VLM-direct-trajectory evaluation (multi-threaded, Vertex-only).
+"""Minimal VLM-direct-trajectory evaluation (multi-threaded).
 
 Pipeline per episode:
     1) Load semantic-map image + GT start/goal/trajectory from Zarr
@@ -7,10 +7,10 @@ Pipeline per episode:
     3) Compute metrics and save JSON/CSV
 
 Notes:
-    - Intentionally minimal: no checkpointing, no visualization, no heavy retry/backoff.
+    - Intentionally minimal: atomic resume checkpoints, no visualization, no heavy retry/backoff.
     - Multi-threaded is kept, but VLM requests are globally serialized and rate-limited
         (e.g., start a request every 2s) to avoid burst/concurrency issues.
-    - Backend is forced to Vertex AI only.
+    - Supports Vertex AI and Google AI Studio (google-genai).
 """
 
 import argparse
@@ -36,18 +36,32 @@ sys.path.insert(0, str(script_dir / "planners"))
 
 # Import VLM trajectory planner
 from vlm_trajectory_planner import VLMTrajectoryPlanner
+from evaluation_io import (
+    TRAJECTORY_ARCHIVE_FILENAME,
+    atomic_write_json,
+    load_evaluation_checkpoint,
+    redact_api_key,
+    remove_error_rows_for_retry,
+    require_api_key_from_env,
+    save_evaluation_checkpoint,
+    apply_adjusted_start_manifest,
+    augment_archive_with_start_provenance,
+    save_trajectory_archive,
+    select_episode_indices,
+    validate_backend_options,
+)
 
 # Thread-local storage for planners (each thread gets its own instance)
 thread_local = threading.local()
 
 # Global gate: do not send concurrent requests; also enforce a minimum interval
 # between starting requests.
-_REQUEST_LOCK = threading.Lock()
+_REQUEST_LOCK = threading.RLock()
 _NEXT_REQUEST_TIME = 0.0
 
 
-def _guarded_vlm_call(fn, *, request_interval_sec: float):
-    """Run one VLM call under a global lock and min-start-interval."""
+def _before_network_request(*, request_interval_sec: float) -> None:
+    """Apply the global start interval to every physical network attempt."""
     global _NEXT_REQUEST_TIME
     interval = max(0.0, float(request_interval_sec))
     with _REQUEST_LOCK:
@@ -55,23 +69,55 @@ def _guarded_vlm_call(fn, *, request_interval_sec: float):
         wait_s = _NEXT_REQUEST_TIME - now
         if wait_s > 0:
             time.sleep(wait_s)
-        # Reserve the next slot *before* executing, to maintain spacing.
         _NEXT_REQUEST_TIME = time.monotonic() + interval
+
+
+def _guarded_vlm_call(fn):
+    """Keep one episode's retry sequence serialized across worker threads."""
+    with _REQUEST_LOCK:
         return fn()
 
 
-def get_vlm_trajectory_planner(num_waypoints: int) -> VLMTrajectoryPlanner:
+def get_vlm_trajectory_planner(
+    num_waypoints: int,
+    *,
+    backend: str,
+    model: str,
+    api_key_env: Optional[str],
+    request_interval_sec: float,
+) -> VLMTrajectoryPlanner:
     """Get thread-local VLM trajectory planner instance."""
-    if not hasattr(thread_local, "vlm_traj_planner"):
-        thread_local.vlm_traj_planner = VLMTrajectoryPlanner(num_waypoints=num_waypoints)
-
-        # Force Vertex-only (fail fast if config switches backend).
-        backend = getattr(thread_local.vlm_traj_planner, "llm_backend", "vertexai")
-        if str(backend).lower() != "vertexai":
-            raise RuntimeError(
-                f"This evaluator requires Vertex AI backend, got llm_backend={backend}. "
-                "Update config.yaml to use Vertex (remove/set llm_backend: vertexai)."
-            )
+    cache_key = (
+        int(num_waypoints),
+        str(backend),
+        str(model),
+        str(api_key_env),
+        float(request_interval_sec),
+    )
+    if getattr(thread_local, "vlm_traj_planner_key", None) != cache_key:
+        thread_local.vlm_traj_planner = VLMTrajectoryPlanner(
+            num_waypoints=num_waypoints,
+            backend=backend,
+            model=model,
+            api_key_env=api_key_env,
+            allow_fallback=True,
+            before_request=lambda: _before_network_request(
+                request_interval_sec=request_interval_sec
+            ),
+            max_output_tokens=8192,
+            genai_use_google_search=False,
+            genai_thinking_level=None,
+            http_timeout_ms=120000,
+        )
+        planner = thread_local.vlm_traj_planner
+        if (
+            planner.max_output_tokens != 8192
+            or planner.genai_use_google_search is not False
+            or planner.genai_thinking_level is not None
+            or planner.http_timeout_ms != 120000
+        ):
+            raise RuntimeError("Direct VLM inference options were not locked as requested")
+        thread_local.vlm_traj_planner_key = cache_key
     return thread_local.vlm_traj_planner
 
 
@@ -195,6 +241,7 @@ def postprocess_existing_results(*, results_path: Path, output_dir: Path, inplac
 class EpisodeData:
     """Single episode data"""
     episode_idx: int
+    sample_id: str
     instruction: str
     scene_id: str
     target_category: str
@@ -315,6 +362,7 @@ class DPZarrDataset:
         
         return EpisodeData(
             episode_idx=idx,
+            sample_id=sample_id,
             instruction=meta['instruction'],
             scene_id=meta['scene_id'],
             target_category=meta['target_category'],
@@ -332,9 +380,14 @@ def evaluate_single_episode(
     *,
     num_waypoints: int,
     request_interval_sec: float,
+    backend: str,
+    model: str,
+    api_key_env: Optional[str],
 ) -> Dict[str, Any]:
     result: Dict[str, Any] = {
+        "dataset_index": episode.episode_idx,
         "episode_idx": episode.episode_idx,
+        "sample_id": episode.sample_id,
         "scene_id": episode.scene_id,
         "instruction": episode.instruction,
         "target_category": episode.target_category,
@@ -343,6 +396,7 @@ def evaluate_single_episode(
         "planner_success": False,
         "error": None,
         "vlm_error": None,
+        "used_fallback": False,
         "vlm_target": None,
         "target_detection_error": None,
         "fge": float("inf"),
@@ -354,17 +408,24 @@ def evaluate_single_episode(
     }
 
     try:
-        planner = get_vlm_trajectory_planner(num_waypoints=num_waypoints)
+        planner = get_vlm_trajectory_planner(
+            num_waypoints=num_waypoints,
+            backend=backend,
+            model=model,
+            api_key_env=api_key_env,
+            request_interval_sec=request_interval_sec,
+        )
         start = episode.start
 
         def _call():
             return planner.generate_trajectory(image=episode.image, instruction=episode.instruction, start=start)
 
-        vlm_result = _guarded_vlm_call(_call, request_interval_sec=request_interval_sec)
+        vlm_result = _guarded_vlm_call(_call)
         if not isinstance(vlm_result, dict):
             raise ValueError("VLM returned non-dict")
 
         result["vlm_error"] = vlm_result.get("error")
+        result["used_fallback"] = bool(vlm_result.get("used_fallback", False))
         if vlm_result.get("error"):
             raise ValueError(str(vlm_result.get("error")))
 
@@ -381,6 +442,7 @@ def evaluate_single_episode(
 
         result["planner_success"] = True
         result["pred_traj_len"] = int(len(traj))
+        result["_pred_trajectory"] = traj
 
         metrics = TrajectoryMetrics(
             pred_traj=traj,
@@ -395,11 +457,11 @@ def evaluate_single_episode(
         return result
 
     except Exception as e:
-        result["error"] = str(e)
+        result["error"] = redact_api_key(e, api_key_env)
         return result
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate VLM Direct Trajectory (minimal, Vertex-only)")
+    parser = argparse.ArgumentParser(description="Evaluate VLM Direct Trajectory")
     parser.add_argument(
         "--dataset",
         type=str,
@@ -418,11 +480,19 @@ def main() -> None:
         default=None,
         help="Number of episodes (default: all)",
     )
-    parser.add_argument(
+    selection_group = parser.add_mutually_exclusive_group()
+    selection_group.add_argument(
         "--stride",
         type=int,
-        default=1,
+        default=None,
         help="Evaluate every N-th episode (default: 1, i.e., evaluate all)",
+    )
+    selection_group.add_argument(
+        "--episode-indices-file",
+        "--episode_indices_file",
+        dest="episode_indices_file",
+        default=None,
+        help="Authoritative text/JSON dataset_index list (mutually exclusive with stride)",
     )
     parser.add_argument(
         "--num_waypoints",
@@ -443,6 +513,35 @@ def main() -> None:
         help="Minimum interval (seconds) between starting VLM requests (global)",
     )
     parser.add_argument(
+        "--adjusted-start-manifest",
+        "--adjusted_start_manifest",
+        dest="adjusted_start_manifest",
+        default=None,
+        help=(
+            "adjusted_start_manifest.npz; start every rollout from its "
+            "hash-locked adjusted pose instead of the raw dataset start"
+        ),
+    )
+    parser.add_argument("--backend", choices=("vertexai", "genai"), default="genai")
+    parser.add_argument("--model", default="gemini-2.5-flash")
+    parser.add_argument(
+        "--api-key-env",
+        "--api_key_env",
+        dest="api_key_env",
+        default="GEMINI_API_KEY",
+        help="Environment variable NAME containing the AI Studio key",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume the exact run from its atomic checkpoint",
+    )
+    parser.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help="With --resume, discard completed error rows and evaluate them again",
+    )
+    parser.add_argument(
         "--postprocess",
         action="store_true",
         help="Postprocess an existing results.json under output_dir (no evaluation run)",
@@ -459,6 +558,8 @@ def main() -> None:
         help="Overwrite the input results.json when postprocessing (default: write results_postprocessed.json)",
     )
     args = parser.parse_args()
+    if args.retry_errors and not args.resume:
+        parser.error("--retry-errors requires --resume")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -471,43 +572,134 @@ def main() -> None:
     print(f"Loading dataset from {args.dataset}")
     dataset = DPZarrDataset(args.dataset)
 
-    num_episodes_limit = args.num_episodes or dataset.num_episodes
-    num_episodes_limit = min(num_episodes_limit, dataset.num_episodes)
-
-    stride = max(1, int(args.stride))
-    episode_indices = list(range(0, num_episodes_limit, stride))
+    backend_config = validate_backend_options(
+        backend=args.backend,
+        model=args.model,
+        api_key_env=args.api_key_env,
+    )
+    if backend_config["backend"] == "genai":
+        require_api_key_from_env(str(backend_config["api_key_env_name"]))
+    episode_indices, selection_config = select_episode_indices(
+        dataset_size=dataset.num_episodes,
+        num_episodes=args.num_episodes,
+        stride=args.stride,
+        episode_indices_file=args.episode_indices_file,
+    )
     num_eval = len(episode_indices)
 
+    start_provenance = None
+    if args.adjusted_start_manifest:
+        start_provenance = apply_adjusted_start_manifest(
+            dataset.episode_meta,
+            Path(args.adjusted_start_manifest),
+            dataset_indices=episode_indices,
+        )
+        print(
+            f"Adjusted starts applied to "
+            f"{start_provenance['adjusted_start_replaced_episodes']} episodes "
+            f"from {Path(args.adjusted_start_manifest).name}"
+        )
+
+    run_config: Dict[str, Any] = {
+        "dataset": str(Path(args.dataset).expanduser().resolve()),
+        "num_episodes": num_eval,
+        **selection_config,
+        "num_waypoints": int(args.num_waypoints),
+        "num_workers": int(args.num_workers),
+        "request_interval": float(args.request_interval),
+        "curvature_resample": int(STANDARD_NUM_WAYPOINTS),
+        **backend_config,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_output_tokens": 8192,
+        "max_attempts": 2,
+        "allow_fallback": True,
+        "genai_use_google_search": False,
+        "genai_thinking_level": None,
+        "http_timeout_ms": 120000,
+        "sdk_http_retry_attempts": 1,
+        "trajectory_archive": TRAJECTORY_ARCHIVE_FILENAME,
+    }
+
     print(
-        f"Evaluating {num_eval} episodes (stride={stride}, limit={num_episodes_limit}) with {args.num_workers} workers; "
+        f"Evaluating {num_eval} episodes ({selection_config['selection_mode']}) with {args.num_workers} workers; "
+        f"backend={backend_config['backend']}, model={backend_config['model']}; "
         f"request_interval={args.request_interval}s (global); "
         f"curvature_resample={STANDARD_NUM_WAYPOINTS}"
     )
 
     results: List[Dict[str, Any]] = []
-    err_count = 0
+    trajectories: List[Optional[np.ndarray]] = []
+    checkpoint_path = output_dir / "evaluation_checkpoint.json"
+    if args.resume:
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"No checkpoint to resume: {checkpoint_path}")
+        results, trajectories = load_evaluation_checkpoint(
+            checkpoint_path,
+            expected_config=run_config,
+            episode_meta=dataset.episode_meta,
+            selected_indices=episode_indices,
+        )
+        print(f"Resumed {len(results)}/{num_eval} completed episodes")
+        if args.retry_errors:
+            results, trajectories, retry_indices = remove_error_rows_for_retry(
+                results, trajectories
+            )
+            save_evaluation_checkpoint(
+                checkpoint_path,
+                config=run_config,
+                results=results,
+                trajectories=trajectories,
+            )
+            print(f"Scheduled {len(retry_indices)} prior error rows for retry")
+    elif checkpoint_path.exists():
+        raise FileExistsError(
+            f"Checkpoint already exists: {checkpoint_path}; pass --resume or use a new output_dir"
+        )
+
+    completed_indices = {int(row["dataset_index"]) for row in results}
+    pending_indices = [index for index in episode_indices if index not in completed_indices]
 
     with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
         future_to_idx = {}
-        for idx in episode_indices:
+        for idx in pending_indices:
             episode = dataset.get_episode(idx)
             fut = executor.submit(
                 evaluate_single_episode,
                 episode,
                 num_waypoints=args.num_waypoints,
                 request_interval_sec=args.request_interval,
+                backend=str(backend_config["backend"]),
+                model=str(backend_config["model"]),
+                api_key_env=backend_config["api_key_env_name"],
             )
             future_to_idx[fut] = idx
 
-        with tqdm(total=num_eval, desc="Episodes", dynamic_ncols=True) as pbar:
+        with tqdm(
+            total=num_eval,
+            initial=len(results),
+            desc="Episodes",
+            dynamic_ncols=True,
+        ) as pbar:
             for fut in as_completed(future_to_idx):
                 r = fut.result()
+                trajectory = r.pop("_pred_trajectory", None)
                 results.append(r)
-                if r.get("error"):
-                    err_count += 1
+                trajectories.append(trajectory)
+                save_evaluation_checkpoint(
+                    checkpoint_path,
+                    config=run_config,
+                    results=results,
+                    trajectories=trajectories,
+                )
                 pbar.update(1)
 
-    results.sort(key=lambda x: int(x.get("episode_idx", 0)))
+    ordered = sorted(
+        zip(results, trajectories), key=lambda item: int(item[0]["dataset_index"])
+    )
+    results = [item[0] for item in ordered]
+    trajectories = [item[1] for item in ordered]
+    err_count = sum(1 for row in results if row.get("error"))
 
     valid = [r for r in results if not r.get("error") and r.get("fge") != float("inf")]
     mask_count = sum(1 for r in valid if r.get("has_mask"))
@@ -544,19 +736,10 @@ def main() -> None:
         print(f"Target error: {_mean(tgt_errs):.4f} ± {_std(tgt_errs):.4f}")
 
     results_file = output_dir / "results.json"
-    with open(results_file, "w", encoding="utf-8") as f:
-        json.dump(
+    atomic_write_json(
+        results_file,
             {
-                "config": {
-                    "dataset": args.dataset,
-                    "num_episodes": num_eval,
-                    "num_episodes_limit": int(num_episodes_limit),
-                    "stride": int(stride),
-                    "num_waypoints": args.num_waypoints,
-                    "num_workers": args.num_workers,
-                    "request_interval": float(args.request_interval),
-                    "curvature_resample": int(STANDARD_NUM_WAYPOINTS),
-                },
+                "config": run_config,
                 "overall": {
                     "fge_mean": _mean(fge_vals),
                     "fge_std": _std(fge_vals),
@@ -574,10 +757,19 @@ def main() -> None:
                 "episode_results": results,
                 "per_scene": compute_per_scene_summary(results),
             },
-            f,
-            indent=2,
-        )
+    )
     print(f"Results saved to {results_file}")
+
+    archive_path = output_dir / TRAJECTORY_ARCHIVE_FILENAME
+    save_trajectory_archive(
+        archive_path,
+        results=results,
+        trajectories=trajectories,
+        episode_meta=dataset.episode_meta,
+    )
+    if start_provenance is not None:
+        augment_archive_with_start_provenance(archive_path, start_provenance)
+    print(f"Trajectory archive saved to {archive_path}")
 
     scene_csv_file = output_dir / "scene_metrics.csv"
     per_scene = compute_per_scene_summary(results)
@@ -596,11 +788,11 @@ def main() -> None:
 
     csv_file = output_dir / "metrics.csv"
     with open(csv_file, "w", encoding="utf-8") as f:
-        f.write("episode_idx,scene_id,fge,cr,plr,curv,target_error,pred_traj_len,gt_traj_len,error\n")
+        f.write("dataset_index,episode_idx,sample_id,scene_id,fge,cr,plr,curv,target_error,used_fallback,pred_traj_len,gt_traj_len,error\n")
         for r in results:
             f.write(
-                f"{r.get('episode_idx','')},{r.get('scene_id','')},{r.get('fge','')},{r.get('cr','')},{r.get('plr','')},{r.get('curv','')},"
-                f"{r.get('target_detection_error','')},{r.get('pred_traj_len','')},{r.get('gt_traj_len','')},"
+                f"{r.get('dataset_index','')},{r.get('episode_idx','')},{r.get('sample_id','')},{r.get('scene_id','')},{r.get('fge','')},{r.get('cr','')},{r.get('plr','')},{r.get('curv','')},"
+                f"{r.get('target_detection_error','')},{r.get('used_fallback','')},{r.get('pred_traj_len','')},{r.get('gt_traj_len','')},"
                 f"{str(r.get('error','')).replace(',', ' ')}\n"
             )
     print(f"CSV saved to {csv_file}")
